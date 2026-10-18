@@ -150,26 +150,13 @@ tab capture / FrameSinkVideoCapturer
 
 | # | 问题 | 依据 / 对策 |
 |---|---|---|
-| 1 | **GPU 进程沙箱拒绝加载第三方 DLL**（致命） | `sandbox_win.cc`：所有沙箱进程都开了 `MITIGATION_FORCE_MS_SIGNED_BINS`（只允许加载微软签名的 DLL）、`MITIGATION_EXTENSION_POINT_DISABLE`、`MITIGATION_IMAGE_LOAD_NO_REMOTE`；`kGpu` 额外加 lockdown DACL 和 random SID。必须用 `--disable-gpu-sandbox`（或 `--no-sandbox`）+ `--allow-third-party-modules` 启动。renderer 沙箱可以保留，但 GPU 进程失去沙箱后，租户隔离只能靠外层的账户/容器/VM。 |
-| 2 | **视频等 overlay 不在根 swap chain 里** | DComp 会把 `<video>` 等提升为独立的 overlay swap chain，hook 根 swap chain 会漏掉。用 `--disable_direct_composition_video_overlays=1`（workaround 同名开关）或 `--disable-direct-composition` 压回单一 swap chain。**backbuffer 里实际有什么，需 PoC 实测。** |
+| 1 | **GPU 进程沙箱拒绝加载第三方 DLL** | `sandbox_win.cc`：沙箱进程的 delayed mitigation 里有 `MITIGATION_FORCE_MS_SIGNED_BINS`（只允许微软签名的 DLL），但**加 `--allow-third-party-modules` 就不再设置这一项**。其余保留：`EXTENSION_POINT_DISABLE`（只封 AppInit / 全局 hook，不影响 `CreateRemoteThread`）、`IMAGE_LOAD_NO_REMOTE`（DLL 放本地盘）、`IMAGE_LOAD_NO_LOW_LABEL`（DLL 文件不能带低完整性标签）。`gpu_process_host.cc`：GPU 进程 token 为 `USER_LIMITED`、**低完整性级别**、job 限制。中/高完整性的启动器向低完整性进程注入是允许的。所以**很可能只需 `--allow-third-party-modules`，不用关 GPU 沙箱**（需 PoC 验证，否则退回 `--disable-gpu-sandbox`）。 |
+| 2 | **视频 overlay 会让 hook 失效** | 已核对：`overlay_processor_win.cc` 一旦有 DC layer（视频 overlay），就给根 render pass 设 `needs_synchronous_dcomp_commit`，`skia_renderer.cc` 于是把根画面从 `DXGISwapChainImageBacking`（composition swap chain，`Present1`）**切换成 `DCompSurfaceImageBacking`（`IDCompositionSurface`，没有 Present）**，视频本身则在另一个 swap chain 里。所以**必须加 `--disable_direct_composition_video_overlays=1`**，保证根画面一直走 swap chain。 |
 | 3 | GPU 进程会重建 | context lost / GPU 崩溃后 browser 会重启 GPU 进程，hook 跟着丢失。需要监听子进程创建并重新注入；也可以用 `--in-process-gpu` 把 GPU 放进 browser 进程，只注入一次（这是测试用开关，稳定性需验证）。 |
 | 4 | 只解决输出 | 输入仍走 CDP `Input.*`（无需注入）。光标形状、剪贴板这类反向通道 CDP 覆盖不全。 |
 | 5 | present 节奏 | 页面内容不变时不 Present，编码端要能重复上一帧；隐藏或 cloak 窗口上的 flip-model Present 会不会被节流（`DXGI_STATUS_OCCLUDED`），需 PoC 验证。 |
-
-**与 CEF 对比**：OBS 自己显示网页（`obs-browser`）用的是 CEF 的 `OnAcceleratedPaint` 共享纹理，而不是对 Chrome 做 present hook。CEF 预编译库（Spotify CDN）直接提供 D3D11 共享纹理和进程内输入（`SendMouseClickEvent/SendKeyEvent`），GPU 沙箱不用关，overlay 也不是问题（它走 capturer）；代价是 popup 要自己叠加，且版本兼容问题要回归测试。
-
-| | Present hook（官方 chrome.exe） | CEF 预编译库 |
-|---|---|---|
-| 编译 Chromium | 否 | 否（只编译自己的宿主） |
-| 零拷贝纹理 | 是（多一次 GPU `CopyResource`，约 0.1 ms） | 是 |
-| GPU 沙箱 | **必须关** | 保留 |
-| 视频 overlay | 要关掉 | 无影响 |
-| popup（`<select>`） | 包含（整窗合成） | 需自己叠加 |
-| 输入 | CDP | 进程内 API |
-| 完整 Chrome 功能（扩展等） | 有 | 部分 |
-| 维护 | 低（DXGI ABI 稳定），但要处理重注入 | 跟随 CEF 版本 |
-
-结论：**两条都不用编译 Chromium**。如果能接受换成 CEF，优先用 CEF。如果必须用官方 Chrome（比如需要扩展、完整 Chrome 行为），present hook 可行且不难写，hook 本身只有几百行（MinHook/Detours），前提是接受关闭 GPU 沙箱，并把租户隔离交给外层。注意 OBS 的 `graphics-hook` 是 GPLv2，闭源产品不要直接复用，可以参考思路自己实现。
+| 6 | **抓到的是整个窗口，含 Chrome UI** | new headless 是完整 Chrome，窗口里有标签栏/工具栏；权限气泡、菜单等是独立 widget（独立 HWND → 独立 DComp presenter / swap chain）。用 `--kiosk` 或 `--start-fullscreen` 去掉浏览器 UI（`HWNDMessageHandlerHeadless` 支持 fullscreen 状态）；hook 会看到多个 swap chain，要按尺寸或创建顺序区分主窗口。`<select>` 下拉是否单独成 swap chain 需 PoC。 |
+| 7 | **一个 Chrome 实例共用一个 GPU 进程** | 多租户按"每租户一个 Chrome 实例（独立 `--user-data-dir`）"，每个实例一个 GPU 进程、一个 hook。 |
 
 ---
 
