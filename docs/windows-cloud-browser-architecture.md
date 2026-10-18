@@ -318,6 +318,34 @@ Ozone 正是为这个场景设计的抽象层，以 `ui/ozone/platform/headless/
 - 打印：Chrome 的打印预览是 WebUI，可以正常显示；禁用"使用系统对话框打印"。
 - 权限气泡、扩展弹窗、对话框都是 views 绘制的，按上面的方法自然能抓到，也能点。
 
+### 不经过 aura/合成器的原生 UI 清单（源码核对）
+
+这类 UI 既不在 capturer 的画面里，也收不到 `SendEventToSink` 的事件；而且它们**不会被 cloak，会直接弹在那台公用电脑的物理屏幕上**。按处理方式分类：
+
+**A. 有统一拦截点：替换实现**
+- **所有文件对话框**：`<input type=file>`、下载"询问保存位置"、File System Access（`showOpenFilePicker` / `showSaveFilePicker` / `showDirectoryPicker`）、Ctrl+O、设置里改下载目录、导入书签、扩展"加载已解压的扩展程序"，全部走 `ui::SelectFileDialog`。Windows 上 Chrome 的 `ChromeSelectFileDialogFactory`（`chrome/browser/win/chrome_select_file_dialog_factory.cc`）甚至把对话框放到单独的 `util_win` 工具进程里执行。处理：在 Chrome 设置完自己的工厂之后，用 `ui::SelectFileDialog::SetFactory()` 换成自己的工厂。打开类：请求客户端选文件 → 上传到该用户临时目录 → 回调 `FileSelected()`；保存类：先存服务器，再推给客户端下载；目录类：映射到用户目录或者不支持。
+
+**B. 有 Chrome 自绘的替代：切开关**
+- **系统通知**：`kNativeNotifications`、`kSystemNotifications` 默认开启（`chrome/common/chrome_features.cc`），通知会弹到物理机的 Windows 操作中心，所有人的通知混在一起。用 `--disable-features=NativeNotifications,SystemNotifications` 退回 Chrome 自己的通知弹窗（views 窗口，可以抓也可以点；哪个开关实际控制 Windows 路径需验证）。
+- **打印**：默认的打印预览是 WebUI，没问题；"使用系统对话框打印"（Ctrl+Shift+P）走原生对话框，要禁用。打印目标用企业策略限制为"另存为 PDF"，生成后推给客户端，避免打到服务器的打印机。
+
+**C. 会跑出 Chrome 的：用策略或补丁禁用**
+- 外部协议（`mailto:`、`zoom:`、`ms-settings:` 等）会在服务器上启动别的程序 → 策略禁止，或在 `ExternalProtocolHandler` 里拦截。
+- 下载项的"打开"/"在文件夹中显示"会在服务器桌面打开程序或资源管理器 → 在下载 UI / `DownloadManagerDelegate` 里禁用。
+- "管理证书"会打开 Windows 证书管理器 → 隐藏入口。
+- WebAuthn / 通行密钥在 Windows 上走系统 `webauthn.dll`，会弹 Windows Hello 系统对话框（还要求物理机的人脸或 PIN）→ 只能禁用或不支持。
+- Eye Dropper API（`chrome/browser/ui/views/eye_dropper/eye_dropper_aura.cc`）会从物理屏幕取色，结果不对 → 禁用，或改成从合成后的画面取色。
+
+**D. 拖放（要改实现）**
+- Windows 上 `DesktopDragDropClientWin` 调用 OLE `::DoDragDrop`（`desktop_drag_drop_client_win.cc`），这个系统模态循环读取的是**真实**鼠标键盘状态，注入的事件驱动不了它，拖动会卡住。在页面里拖图片、拖选中的文字、把标签页拖出窗口都会触发。处理：在 fork 里换成进程内的拖放实现（可以参考 Ozone 的 `DesktopDragDropClientOzone` 思路，由注入事件驱动），或者先禁用跨窗口的系统拖放。从客户端往页面拖文件，另外走上传通道。
+
+**E. 不用处理（已确认是 Chrome 自己绘制）**
+- 工具提示：Windows 上只有 `TooltipAura`（views 绘制），没有原生 tooltip 实现。
+- `<select>`、日期和颜色选择器（Blink 页面弹窗）、右键菜单、权限气泡、HTTP 认证框、客户端证书选择框、画中画窗口、DevTools 窗口：都是 views 或页面绘制的，各自是 aura 顶层窗口，按前面的方法抓取和注入即可。
+
+**F. 兜底**
+在自己的 fork 里，监听本进程新建的、不属于 aura 的顶层窗口（漏网的原生对话框）：记日志并关闭，同时把它加进待处理清单。
+
 ### 延迟相关开关（已核对）
 
 `--double-buffer-compositing`、`--disable-gpu-vsync`（不建议用 `--disable-frame-rate-limit`，多实例时 GPU 压力过大）、`--disable-renderer-backgrounding`、`--disable-background-timer-throttling`。如果后面要按需出帧，把外部 BeginFrame（`ui::Compositor` 的 `ExternalBeginFrameController`）也接进来。
