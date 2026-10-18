@@ -72,8 +72,13 @@
 
 1. `VizProcessTransportFactory::OnEstablishedGpuChannel()`（`content/browser/compositor/viz_process_transport_factory.cc`）组装 `RootCompositorFrameSinkParams`：
    - `:423` `root_params->widget = compositor->widget();`
-   - **【P1】** 改为：cloud 模式 **且** `gpu_compositing == true` 时传 `gfx::kNullAcceleratedWidget`，否则保持原样。
-   - 为什么只在 GPU 合成时改：软件合成回退走 `CreateSoftwareOutputDeviceWin(hwnd, ...)`（`components/viz/service/display_embedder/software_output_device_win.cc` 约 `:186`），要求真实 HWND，传空句柄会坏。
+   - **【P1】** 改为：cloud 模式下传 `gfx::kNullAcceleratedWidget`。
+   - 软件合成（`--disable-gpu`、GPU 被 blocklist、GPU 反复崩溃后的回退、或某个 widget 设了 `force_software_compositing`）**在 headless 下本来就不用 HWND**，所以 P1 不需要区分 GPU/软件：
+     - browser 进程把 `--headless` 转发给 GPU 进程（`content/browser/gpu/gpu_process_host.cc:294`，在复制给 GPU 进程的开关列表里）；
+     - GPU 进程 `VizCompositorThreadRunnerImpl` 读取它（`components/viz/service/main/viz_compositor_thread_runner_impl.cc:241`），传给 `OutputSurfaceProviderImpl(gpu_service, headless)`；
+     - `OutputSurfaceProviderImpl::CreateSoftwareOutputDeviceForPlatform()`（`output_surface_provider_impl.cc:144`）开头就是 `if (headless_) return std::make_unique<SoftwareOutputDevice>();`，即一个只画进内存位图的基础设备，**根本不走** `CreateSoftwareOutputDeviceWin(hwnd, ...)`（那条路径才需要真实 HWND，会建 swap chain 或 layered window）。
+     - 换句话说，现有的 `--headless=new` 软件路径已经是"离屏、不进 DWM"了，P1 只是让 GPU 路径也变成同样的行为。
+   - 软件模式下取帧仍然可用，但会降级：没有 GPU 上下文，capturer 拿不到带 native handle 的 SharedImage，只能交付共享内存里的 CPU 帧（I420/ARGB），编码进程需要上传到 GPU 再编码。把它当作降级模式，正常运行应保证走 GPU 合成（网关检测到降级时报警）。
    - 同文件里其余用到 `compositor->widget()` 的地方（`HostDisplayClient` 构造、`RenderingWindowManager::RegisterParent/UnregisterParent`、`AddChildWindowToBrowser`）保持不变：离屏模式下 GPU 不会创建子窗口，这些代码只是空转。**PoC：确认没有地方断言句柄非空。**
 2. GPU 进程：`RootCompositorFrameSinkImpl::Create()`（`components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc:132-136`）→ `OutputSurfaceProviderImpl::CreateOutputSurface(widget, gpu_compositing=true, ...)` → `SkiaOutputSurfaceImpl::Create()`。
 3. `SkiaOutputSurfaceImplOnGpu::InitializeForDawn()`（Windows 默认 Graphite + Dawn D3D11：`gpu_finch_features.cc` 的 `kSkiaGraphite` 默认开启，`DawnContextProvider::GetDefaultBackendType()` 返回 D3D11）：
@@ -156,7 +161,7 @@
 
 | ID | 位置（M158） | 改动 | 估计规模 | 阶段 |
 |---|---|---|---|---|
-| P1 | `content/browser/compositor/viz_process_transport_factory.cc:423` | cloud 模式且 GPU 合成时 `root_params->widget = gfx::kNullAcceleratedWidget` | ~10 行 | 1 |
+| P1 | `content/browser/compositor/viz_process_transport_factory.cc:423` | cloud 模式下 `root_params->widget = gfx::kNullAcceleratedWidget`（软件合成在 headless 下本来就走内存位图设备，无需区分） | ~10 行 | 1 |
 | P2 | `chrome/browser/headless/chrome_browser_main_extra_parts_headless.cc` `PreBrowserStart()` | 初始化 `CloudStreamController`，覆盖安装 `SelectFileDialogFactory`，挂剪贴板桥接 | ~20 行 | 1 |
 | P3 | 新目录 `chrome/browser/cloud_stream/`（含 BUILD.gn、DEPS） | HostTracker（`aura::EnvObserver` + `WindowTreeHostObserver`）、capturer 管理与 consumer、命名管道 IPC、InputInjector、文件对话框工厂、下载/剪贴板桥接、非 aura 窗口兜底 | 2–4k 行 | 1 |
 | P4 | `ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc:900` `SetCursorNative()` | 光标变化通知 controller（通过一个全局 observer 接口，避免 views 依赖 chrome） | ~20 行 | 1 |
