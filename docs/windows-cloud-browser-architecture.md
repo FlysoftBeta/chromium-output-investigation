@@ -57,6 +57,8 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 
 ### 1.0 `chrome --headless`（new headless）在 Windows 上的实际路径（源码核对）
 
+> `--headless`、`--headless=new` 走的是同一条路径：M158 的 `headless::IsHeadlessMode()` 只调用 `HasSwitch(kHeadless)`，不看值，`chrome/app` 里也没有按值分支。old headless 早已从 chrome.exe 里移除，拆成了单独的 headless_shell / chrome-headless-shell（即下表右列）。
+
 ```
 chrome.exe --headless
   │ chrome/browser/headless/headless_mode_init.cc
