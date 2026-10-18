@@ -318,6 +318,17 @@ Ozone 正是为这个场景设计的抽象层，以 `ui/ozone/platform/headless/
 - 打印：Chrome 的打印预览是 WebUI，可以正常显示；禁用"使用系统对话框打印"。
 - 权限气泡、扩展弹窗、对话框都是 views 绘制的，按上面的方法自然能抓到，也能点。
 
+### 完全不进 DWM：切断窗口的渲染输出
+
+**不推荐：自己写一个没有 HWND 的 aura backend。** 平台无关的 `DesktopWindowTreeHostPlatform` 只在 `use_ozone` 下编译（`ui/views/BUILD.gn`），Windows 用不了；Chrome 浏览器主窗口还专门用了 `BrowserDesktopWindowTreeHostWin`（`chrome/browser/ui/views/frame/`），frame、任务栏、窗口位置、TSF、UIA、原生主题等代码都默认有 HWND。去掉 HWND 等于把 Linux 桌面路径移植到 Windows，改动可能上万行。
+
+**推荐：保留 HWND 当消息外壳，只给 GPU 传空句柄。**
+- `content/browser/compositor/viz_process_transport_factory.cc` 创建根 frame sink 时有一行 `root_params->widget = compositor->widget();`（`GPU_SURFACE_HANDLE_IS_ACCELERATED_WINDOW`，Windows 上生效）。在你的模式下改成 `gfx::kNullAcceleratedWidget`，GPU 端 `IsOffscreen()` 为真，走 `SkiaOutputDeviceOffscreen`：不建 DComp、不建 swap chain、不 Present、不建 GPU 子窗口，**完全不进 DWM**。
+- HWND 继续存在（cloak 隐藏），只作为 Windows 相关代码的外壳；输入照样走 `SendEventToSink`。
+- 取帧不受影响：每窗口的 capturer 挂在 frame sink 上，与输出设备无关；想再省一次拷贝，就把 `SkiaOutputDeviceOffscreen` 改成分配带 shared handle 的 SharedImage（§1.1 的方案 b）。
+- 出帧节奏不再跟 DComp/vsync 绑定，可以接入 `ui::Compositor` 的 `ExternalBeginFrameController` 按需出帧。
+- 需 PoC：同一文件里还有几处使用 `compositor->widget()`（display client、DComp 子窗口相关）；Windows 路径上是否有地方断言句柄非空，要实际跑一下才能确认。补丁规模估计几十行。
+
 ### 不经过 aura/合成器的原生 UI 清单（源码核对）
 
 这类 UI 既不在 capturer 的画面里，也收不到 `SendEventToSink` 的事件；而且它们**不会被 cloak，会直接弹在那台公用电脑的物理屏幕上**。按处理方式分类：
