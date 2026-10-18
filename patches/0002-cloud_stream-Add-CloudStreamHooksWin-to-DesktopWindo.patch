@@ -1,0 +1,179 @@
+From 5de0795cd25fa906ddb1c8fc0e1c3fc92d0bda28 Mon Sep 17 00:00:00 2001
+From: FlysoftBeta <xwnunjyau@outlook.com>
+Date: Sun, 18 Oct 2026 03:15:16 +0000
+Subject: [PATCH 2/3] [cloud_stream] Add CloudStreamHooksWin to
+ DesktopWindowTreeHostWin
+
+Lets the embedder enable external BeginFrame control, observe cursor
+changes and replace the OLE drag and drop client. No behavior change
+unless hooks are registered.
+---
+ ui/views/BUILD.gn                             |  2 +
+ .../desktop_aura/cloud_stream_hooks_win.cc    | 23 ++++++++
+ .../desktop_aura/cloud_stream_hooks_win.h     | 57 +++++++++++++++++++
+ .../desktop_window_tree_host_win.cc           | 17 +++++-
+ 4 files changed, 98 insertions(+), 1 deletion(-)
+ create mode 100644 ui/views/widget/desktop_aura/cloud_stream_hooks_win.cc
+ create mode 100644 ui/views/widget/desktop_aura/cloud_stream_hooks_win.h
+
+diff --git a/ui/views/BUILD.gn b/ui/views/BUILD.gn
+index c0d1b5ed..c2617d75 100644
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -946,10 +946,12 @@ component("views") {
+       ]
+       if (is_win) {
+         public += [
++          "widget/desktop_aura/cloud_stream_hooks_win.h",
+           "widget/desktop_aura/desktop_drag_drop_client_win.h",
+           "widget/desktop_aura/desktop_window_tree_host_win.h",
+         ]
+         sources += [
++          "widget/desktop_aura/cloud_stream_hooks_win.cc",
+           "widget/desktop_aura/desktop_drag_drop_client_win.cc",
+           "widget/desktop_aura/desktop_drop_target_win.cc",
+           "widget/desktop_aura/desktop_native_cursor_manager_win.cc",
+diff --git a/ui/views/widget/desktop_aura/cloud_stream_hooks_win.cc b/ui/views/widget/desktop_aura/cloud_stream_hooks_win.cc
+new file mode 100644
+index 00000000..a2ccbd09
+--- /dev/null
++++ b/ui/views/widget/desktop_aura/cloud_stream_hooks_win.cc
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/views/widget/desktop_aura/cloud_stream_hooks_win.h"
++
++namespace views {
++
++namespace {
++CloudStreamHooksWin* g_hooks = nullptr;
++}  // namespace
++
++// static
++void CloudStreamHooksWin::Set(CloudStreamHooksWin* hooks) {
++  g_hooks = hooks;
++}
++
++// static
++CloudStreamHooksWin* CloudStreamHooksWin::Get() {
++  return g_hooks;
++}
++
++}  // namespace views
+diff --git a/ui/views/widget/desktop_aura/cloud_stream_hooks_win.h b/ui/views/widget/desktop_aura/cloud_stream_hooks_win.h
+new file mode 100644
+index 00000000..e85fefa1
+--- /dev/null
++++ b/ui/views/widget/desktop_aura/cloud_stream_hooks_win.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_VIEWS_WIDGET_DESKTOP_AURA_CLOUD_STREAM_HOOKS_WIN_H_
++#define UI_VIEWS_WIDGET_DESKTOP_AURA_CLOUD_STREAM_HOOKS_WIN_H_
++
++#include <memory>
++
++#include "ui/views/views_export.h"
++
++namespace aura {
++class WindowTreeHost;
++namespace client {
++class DragDropClient;
++}  // namespace client
++}  // namespace aura
++
++namespace ui {
++class Cursor;
++}  // namespace ui
++
++namespace views {
++
++// Hooks used by DesktopWindowTreeHostWin when the browser runs in cloud
++// streaming mode (--cloud-stream-pipe). Views cannot depend on //chrome, so
++// the embedder implements this interface and registers it with Set().
++// When no hooks are registered, DesktopWindowTreeHostWin behaves as usual.
++class VIEWS_EXPORT CloudStreamHooksWin {
++ public:
++  virtual ~CloudStreamHooksWin() = default;
++
++  // Registers the process-wide hooks. Pass nullptr to unregister. Must be
++  // called on the UI thread, before any top-level window is created.
++  static void Set(CloudStreamHooksWin* hooks);
++  static CloudStreamHooksWin* Get();
++
++  // Whether new compositors should be created with external BeginFrame
++  // control. The embedder is then responsible for issuing BeginFrames.
++  virtual bool UseExternalBeginFrameControl() = 0;
++
++  // Called whenever a host changes its cursor, before the native cursor is
++  // set. The embedder forwards it to the remote client, which draws the
++  // cursor locally.
++  virtual void OnCursorChanged(aura::WindowTreeHost* host,
++                               const ui::Cursor& cursor) = 0;
++
++  // Returns the drag and drop client to use for `host`. The native OLE client
++  // runs a modal loop driven by the physical mouse, which remote input cannot
++  // drive, so the embedder must provide its own implementation.
++  virtual std::unique_ptr<aura::client::DragDropClient> CreateDragDropClient(
++      aura::WindowTreeHost* host) = 0;
++};
++
++}  // namespace views
++
++#endif  // UI_VIEWS_WIDGET_DESKTOP_AURA_CLOUD_STREAM_HOOKS_WIN_H_
+diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
+index 228f4a8f..92f24385 100644
+--- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
++++ b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
+@@ -63,6 +63,7 @@
+ #include "ui/views/corewm/tooltip_aura.h"
+ #include "ui/views/views_features.h"
+ #include "ui/views/views_switches.h"
++#include "ui/views/widget/desktop_aura/cloud_stream_hooks_win.h"
+ #include "ui/views/widget/desktop_aura/desktop_drag_drop_client_win.h"
+ #include "ui/views/widget/desktop_aura/desktop_native_cursor_manager.h"
+ #include "ui/views/widget/desktop_aura/desktop_native_cursor_manager_win.h"
+@@ -300,7 +301,12 @@ void DesktopWindowTreeHostWin::Init(const Widget::InitParams& params) {
+ 
+   UpdateBackdropColorMode();
+ 
+-  CreateCompositor(params.force_software_compositing);
++  // In cloud streaming mode the embedder may drive BeginFrames itself.
++  CloudStreamHooksWin* cloud_stream_hooks = CloudStreamHooksWin::Get();
++  CreateCompositor(params.force_software_compositing,
++                   /*use_external_begin_frame_control=*/
++                   cloud_stream_hooks &&
++                       cloud_stream_hooks->UseExternalBeginFrameControl());
+   OnAcceleratedWidgetAvailable();
+   InitHost();
+   window()->Show();
+@@ -351,6 +357,11 @@ std::unique_ptr<corewm::Tooltip> DesktopWindowTreeHostWin::CreateTooltip() {
+ 
+ std::unique_ptr<aura::client::DragDropClient>
+ DesktopWindowTreeHostWin::CreateDragDropClient() {
++  // The OLE drag loop is driven by the physical mouse, so in cloud streaming
++  // mode the embedder supplies a client that remote input can drive.
++  if (CloudStreamHooksWin* hooks = CloudStreamHooksWin::Get()) {
++    return hooks->CreateDragDropClient(this);
++  }
+   auto res =
+       std::make_unique<DesktopDragDropClientWin>(window(), GetHWND(), this);
+   drag_drop_client_ = res->GetWeakPtr();
+@@ -901,6 +912,10 @@ void DesktopWindowTreeHostWin::SetCursorNative(gfx::NativeCursor cursor) {
+   TRACE_EVENT1("ui,input", "DesktopWindowTreeHostWin::SetCursorNative",
+                "cursor", cursor.type());
+ 
++  if (CloudStreamHooksWin* hooks = CloudStreamHooksWin::Get()) {
++    hooks->OnCursorChanged(this, cursor);
++  }
++
+   message_handler_->SetCursor(
+       ui::WinCursor::FromPlatformCursor(cursor.platform()));
+ }
+-- 
+2.43.0
+

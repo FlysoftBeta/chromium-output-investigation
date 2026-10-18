@@ -1,0 +1,72 @@
+From e8b1e2ed29b8e0051eef48bc8e8ad96cc566aee2 Mon Sep 17 00:00:00 2001
+From: FlysoftBeta <xwnunjyau@outlook.com>
+Date: Sun, 18 Oct 2026 03:15:15 +0000
+Subject: [PATCH 1/3] [cloud_stream] Render top-level windows offscreen in
+ cloud streaming mode
+
+Adds --cloud-stream-pipe and --cloud-stream-external-begin-frame. With
+--cloud-stream-pipe the browser keeps the HWND but does not hand it to the
+GPU process, so viz uses SkiaOutputDeviceOffscreen and nothing is
+presented to DComp/DWM. Software compositing in headless mode already
+uses an in-memory SoftwareOutputDevice.
+---
+ .../compositor/viz_process_transport_factory.cc    | 14 ++++++++++++++
+ ui/base/ui_base_switches.h                         | 10 ++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/content/browser/compositor/viz_process_transport_factory.cc b/content/browser/compositor/viz_process_transport_factory.cc
+index 53219f0a..bfd96b25 100644
+--- a/content/browser/compositor/viz_process_transport_factory.cc
++++ b/content/browser/compositor/viz_process_transport_factory.cc
+@@ -52,6 +52,7 @@
+ #include "ui/base/ui_base_features.h"
+ 
+ #if BUILDFLAG(IS_WIN)
++#include "ui/base/ui_base_switches.h"
+ #include "ui/gfx/win/rendering_window_manager.h"
+ #endif
+ 
+@@ -421,6 +422,19 @@ void VizProcessTransportFactory::OnEstablishedGpuChannel(
+   root_params->frame_sink_id = compositor->frame_sink_id();
+ #if defined(GPU_SURFACE_HANDLE_IS_ACCELERATED_WINDOW)
+   root_params->widget = compositor->widget();
++#if BUILDFLAG(IS_WIN)
++  // In cloud streaming mode the HWND stays in the browser process as a shell
++  // for Windows-specific code, but the GPU process is not told about it. The
++  // GPU side then treats the display as offscreen (SkiaOutputDeviceOffscreen):
++  // no DComp tree, no swap chain, nothing is presented to DWM. Frames are
++  // taken with a FrameSinkVideoCapturer instead. Software compositing in
++  // headless mode already uses an in-memory SoftwareOutputDevice, so this is
++  // safe for both compositing modes.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kCloudStreamPipe)) {
++    root_params->widget = gfx::kNullAcceleratedWidget;
++  }
++#endif  // BUILDFLAG(IS_WIN)
+ #endif
+   root_params->gpu_compositing = gpu_compositing;
+   root_params->renderer_settings = viz::CreateRendererSettings();
+diff --git a/ui/base/ui_base_switches.h b/ui/base/ui_base_switches.h
+index 78095269..052d4d3b 100644
+--- a/ui/base/ui_base_switches.h
++++ b/ui/base/ui_base_switches.h
+@@ -54,6 +54,16 @@ inline constexpr char kQtVersionFlag[] = "qt-version";
+ inline constexpr char kDisableGtkIme[] = "disable-gtk-ime";
+ #endif
+ 
++// Cloud streaming mode. The value is the name of the local named pipe used to
++// talk to the streaming gateway. When present, top-level windows render
++// offscreen, frames are delivered to the gateway and input comes from it.
++inline constexpr char kCloudStreamPipe[] = "cloud-stream-pipe";
++
++// In cloud streaming mode, lets the gateway drive BeginFrames for every
++// top-level window instead of the default synthetic 60Hz clock.
++inline constexpr char kCloudStreamExternalBeginFrame[] =
++    "cloud-stream-external-begin-frame";
++
+ // Treats DRM virtual connector as external to enable display mode change in VM.
+ inline constexpr char kDRMVirtualConnectorIsExternal[] =
+     "drm-virtual-connector-is-external";
+-- 
+2.43.0
+

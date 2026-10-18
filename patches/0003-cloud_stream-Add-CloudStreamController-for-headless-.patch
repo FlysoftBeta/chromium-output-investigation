@@ -1,0 +1,1706 @@
+From 1c8883b23d050d991f40976967d21b39e60f165f Mon Sep 17 00:00:00 2001
+From: FlysoftBeta <xwnunjyau@outlook.com>
+Date: Sun, 18 Oct 2026 03:15:17 +0000
+Subject: [PATCH 3/3] [cloud_stream] Add CloudStreamController for
+ --headless=new
+
+Tracks top-level aura hosts, captures each one with a
+FrameSinkVideoCapturer and sends D3D11 textures to the gateway over a
+named pipe, forwards cursor changes, drives external BeginFrames and
+replaces native file choosers with remote requests. Remote input is
+declared in remote_input.h but not implemented yet.
+---
+ chrome/browser/cloud_stream/BUILD.gn          |  47 ++
+ chrome/browser/cloud_stream/DEPS              |  14 +
+ .../cloud_stream/cloud_select_file_dialog.cc  | 108 +++++
+ .../cloud_stream/cloud_select_file_dialog.h   |  62 +++
+ .../cloud_stream/cloud_stream_controller.cc   | 429 ++++++++++++++++++
+ .../cloud_stream/cloud_stream_controller.h    | 119 +++++
+ chrome/browser/cloud_stream/pipe_transport.cc | 127 ++++++
+ chrome/browser/cloud_stream/pipe_transport.h  |  67 +++
+ .../public/cloud_stream_protocol.h            | 226 +++++++++
+ chrome/browser/cloud_stream/remote_input.h    |  48 ++
+ chrome/browser/cloud_stream/window_stream.cc  | 163 +++++++
+ chrome/browser/cloud_stream/window_stream.h   |  94 ++++
+ chrome/browser/headless/BUILD.gn              |   4 +
+ ...hrome_browser_main_extra_parts_headless.cc |  16 +
+ ...chrome_browser_main_extra_parts_headless.h |  16 +
+ 15 files changed, 1540 insertions(+)
+ create mode 100644 chrome/browser/cloud_stream/BUILD.gn
+ create mode 100644 chrome/browser/cloud_stream/DEPS
+ create mode 100644 chrome/browser/cloud_stream/cloud_select_file_dialog.cc
+ create mode 100644 chrome/browser/cloud_stream/cloud_select_file_dialog.h
+ create mode 100644 chrome/browser/cloud_stream/cloud_stream_controller.cc
+ create mode 100644 chrome/browser/cloud_stream/cloud_stream_controller.h
+ create mode 100644 chrome/browser/cloud_stream/pipe_transport.cc
+ create mode 100644 chrome/browser/cloud_stream/pipe_transport.h
+ create mode 100644 chrome/browser/cloud_stream/public/cloud_stream_protocol.h
+ create mode 100644 chrome/browser/cloud_stream/remote_input.h
+ create mode 100644 chrome/browser/cloud_stream/window_stream.cc
+ create mode 100644 chrome/browser/cloud_stream/window_stream.h
+
+diff --git a/chrome/browser/cloud_stream/BUILD.gn b/chrome/browser/cloud_stream/BUILD.gn
+new file mode 100644
+index 00000000..a48635a0
+--- /dev/null
++++ b/chrome/browser/cloud_stream/BUILD.gn
+@@ -0,0 +1,47 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++assert(is_win, "Cloud streaming mode is only implemented on Windows.")
++
++source_set("protocol") {
++  sources = [ "public/cloud_stream_protocol.h" ]
++}
++
++source_set("cloud_stream") {
++  sources = [
++    "cloud_select_file_dialog.cc",
++    "cloud_select_file_dialog.h",
++    "cloud_stream_controller.cc",
++    "cloud_stream_controller.h",
++    "pipe_transport.cc",
++    "pipe_transport.h",
++    "window_stream.cc",
++    "window_stream.h",
++
++    # TODO(cloud_stream): add remote_input.cc once implemented.
++    "remote_input.h",
++  ]
++
++  public_deps = [ ":protocol" ]
++
++  deps = [
++    "//base",
++    "//components/viz/common",
++    "//components/viz/host",
++    "//media",
++    "//mojo/public/cpp/bindings",
++    "//services/viz/privileged/mojom",
++    "//skia",
++    "//ui/aura",
++    "//ui/base",
++    "//ui/base/cursor",
++    "//ui/base/cursor/mojom:cursor_type",
++    "//ui/base/dragdrop/mojom",
++    "//ui/compositor",
++    "//ui/events",
++    "//ui/gfx",
++    "//ui/shell_dialogs",
++    "//ui/views",
++  ]
++}
+diff --git a/chrome/browser/cloud_stream/DEPS b/chrome/browser/cloud_stream/DEPS
+new file mode 100644
+index 00000000..053b87ec
+--- /dev/null
++++ b/chrome/browser/cloud_stream/DEPS
+@@ -0,0 +1,14 @@
++include_rules = [
++  "+components/viz/common",
++  "+components/viz/host",
++  "+media/base",
++  "+services/viz/privileged/mojom",
++  "+third_party/skia/include/core",
++  "+ui/aura",
++  "+ui/base",
++  "+ui/compositor",
++  "+ui/events",
++  "+ui/gfx",
++  "+ui/shell_dialogs",
++  "+ui/views",
++]
+diff --git a/chrome/browser/cloud_stream/cloud_select_file_dialog.cc b/chrome/browser/cloud_stream/cloud_select_file_dialog.cc
+new file mode 100644
+index 00000000..2db247e7
+--- /dev/null
++++ b/chrome/browser/cloud_stream/cloud_select_file_dialog.cc
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/cloud_stream/cloud_select_file_dialog.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/cloud_stream/cloud_stream_controller.h"
++#include "ui/shell_dialogs/select_file_policy.h"
++#include "ui/shell_dialogs/selected_file_info.h"
++
++namespace cloud_stream {
++
++namespace {
++
++FileChooserMode ModeForType(ui::SelectFileDialog::Type type) {
++  switch (type) {
++    case ui::SelectFileDialog::SELECT_FOLDER:
++    case ui::SelectFileDialog::SELECT_UPLOAD_FOLDER:
++    case ui::SelectFileDialog::SELECT_EXISTING_FOLDER:
++      return FileChooserMode::kFolder;
++    case ui::SelectFileDialog::SELECT_SAVEAS_FILE:
++      return FileChooserMode::kSave;
++    case ui::SelectFileDialog::SELECT_OPEN_MULTI_FILE:
++      return FileChooserMode::kOpenMultiple;
++    case ui::SelectFileDialog::SELECT_NONE:
++    case ui::SelectFileDialog::SELECT_OPEN_FILE:
++      return FileChooserMode::kOpen;
++  }
++  return FileChooserMode::kOpen;
++}
++
++}  // namespace
++
++CloudSelectFileDialog::CloudSelectFileDialog(
++    Listener* listener,
++    std::unique_ptr<ui::SelectFilePolicy> policy)
++    : ui::SelectFileDialog(listener, std::move(policy)) {}
++
++CloudSelectFileDialog::~CloudSelectFileDialog() = default;
++
++bool CloudSelectFileDialog::IsRunning(gfx::NativeWindow owning_window) const {
++  return running_;
++}
++
++void CloudSelectFileDialog::ListenerDestroyed() {
++  listener_ = nullptr;
++}
++
++bool CloudSelectFileDialog::HasMultipleFileTypeChoicesImpl() {
++  return false;
++}
++
++void CloudSelectFileDialog::SelectFileImpl(
++    Type type,
++    const std::u16string& title,
++    const base::FilePath& default_path,
++    const FileTypeInfo* file_types,
++    int file_type_index,
++    const base::FilePath::StringType& default_extension,
++    gfx::NativeWindow owning_window,
++    const GURL* caller) {
++  CloudStreamController* controller = CloudStreamController::Get();
++  if (!controller) {
++    if (listener_) {
++      listener_->FileSelectionCanceled();
++    }
++    return;
++  }
++  type_ = type;
++  running_ = true;
++  // Keep `this` alive until the gateway answers.
++  controller->RequestFileChooser(
++      owning_window, ModeForType(type), title,
++      base::BindOnce(&CloudSelectFileDialog::OnResult,
++                     scoped_refptr<CloudSelectFileDialog>(this)));
++}
++
++void CloudSelectFileDialog::OnResult(bool canceled,
++                                     std::vector<base::FilePath> paths) {
++  running_ = false;
++  if (!listener_) {
++    return;
++  }
++  if (canceled || paths.empty()) {
++    listener_->FileSelectionCanceled();
++    return;
++  }
++  if (type_ == SELECT_OPEN_MULTI_FILE) {
++    std::vector<ui::SelectedFileInfo> files;
++    for (const auto& path : paths) {
++      files.emplace_back(path);
++    }
++    listener_->MultiFilesSelected(files);
++    return;
++  }
++  listener_->FileSelected(ui::SelectedFileInfo(paths.front()), /*index=*/0);
++}
++
++ui::SelectFileDialog* CloudSelectFileDialogFactory::Create(
++    ui::SelectFileDialog::Listener* listener,
++    std::unique_ptr<ui::SelectFilePolicy> policy) {
++  return new CloudSelectFileDialog(listener, std::move(policy));
++}
++
++}  // namespace cloud_stream
+diff --git a/chrome/browser/cloud_stream/cloud_select_file_dialog.h b/chrome/browser/cloud_stream/cloud_select_file_dialog.h
+new file mode 100644
+index 00000000..abf25f7e
+--- /dev/null
++++ b/chrome/browser/cloud_stream/cloud_select_file_dialog.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CLOUD_STREAM_CLOUD_SELECT_FILE_DIALOG_H_
++#define CHROME_BROWSER_CLOUD_STREAM_CLOUD_SELECT_FILE_DIALOG_H_
++
++#include <memory>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "ui/shell_dialogs/select_file_dialog.h"
++#include "ui/shell_dialogs/select_file_dialog_factory.h"
++
++namespace cloud_stream {
++
++// Replaces every native file chooser (<input type=file>, Save As, File System
++// Access pickers, Ctrl+O, ...) with a request to the remote client. The
++// client picks files on its own machine, the gateway uploads them into the
++// user's directory on the server and answers with the resulting paths.
++class CloudSelectFileDialog : public ui::SelectFileDialog {
++ public:
++  CloudSelectFileDialog(Listener* listener,
++                        std::unique_ptr<ui::SelectFilePolicy> policy);
++  CloudSelectFileDialog(const CloudSelectFileDialog&) = delete;
++  CloudSelectFileDialog& operator=(const CloudSelectFileDialog&) = delete;
++
++  // ui::BaseShellDialog:
++  bool IsRunning(gfx::NativeWindow owning_window) const override;
++  void ListenerDestroyed() override;
++
++ protected:
++  ~CloudSelectFileDialog() override;
++
++  // ui::SelectFileDialog:
++  void SelectFileImpl(Type type,
++                      const std::u16string& title,
++                      const base::FilePath& default_path,
++                      const FileTypeInfo* file_types,
++                      int file_type_index,
++                      const base::FilePath::StringType& default_extension,
++                      gfx::NativeWindow owning_window,
++                      const GURL* caller) override;
++  bool HasMultipleFileTypeChoicesImpl() override;
++
++ private:
++  void OnResult(bool canceled, std::vector<base::FilePath> paths);
++
++  Type type_ = SELECT_NONE;
++  bool running_ = false;
++};
++
++class CloudSelectFileDialogFactory : public ui::SelectFileDialogFactory {
++ public:
++  ui::SelectFileDialog* Create(
++      ui::SelectFileDialog::Listener* listener,
++      std::unique_ptr<ui::SelectFilePolicy> policy) override;
++};
++
++}  // namespace cloud_stream
++
++#endif  // CHROME_BROWSER_CLOUD_STREAM_CLOUD_SELECT_FILE_DIALOG_H_
+diff --git a/chrome/browser/cloud_stream/cloud_stream_controller.cc b/chrome/browser/cloud_stream/cloud_stream_controller.cc
+new file mode 100644
+index 00000000..c471bd2e
+--- /dev/null
++++ b/chrome/browser/cloud_stream/cloud_stream_controller.cc
+@@ -0,0 +1,429 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/cloud_stream/cloud_stream_controller.h"
++
++#include <windows.h>
++
++#include <cstring>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "base/strings/string_split.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/cloud_stream/cloud_select_file_dialog.h"
++#include "chrome/browser/cloud_stream/pipe_transport.h"
++#include "chrome/browser/cloud_stream/window_stream.h"
++#include "components/viz/common/frame_sinks/begin_frame_args.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/aura/client/drag_drop_client.h"
++#include "ui/aura/env.h"
++#include "ui/aura/window.h"
++#include "ui/aura/window_tree_host.h"
++#include "ui/base/cursor/cursor.h"
++#include "ui/base/cursor/mojom/cursor_type.mojom-shared.h"
++#include "ui/base/dragdrop/mojom/drag_drop_types.mojom-shared.h"
++#include "ui/base/ui_base_switches.h"
++#include "ui/compositor/compositor.h"
++#include "ui/shell_dialogs/select_file_dialog.h"
++#include "ui/views/widget/widget.h"
++
++namespace cloud_stream {
++
++namespace {
++
++CloudStreamController* g_controller = nullptr;
++
++// Default capture pacing when the gateway does not drive BeginFrames.
++constexpr base::TimeDelta kDefaultCapturePeriod = base::Hertz(60);
++
++template <typename T>
++bool ReadStruct(const std::vector<uint8_t>& payload, T* out) {
++  if (payload.size() < sizeof(T)) {
++    return false;
++  }
++  std::memcpy(out, payload.data(), sizeof(T));
++  return true;
++}
++
++// Reads `length` UTF-16 code units that follow a struct of type T.
++template <typename T>
++std::u16string ReadTail(const std::vector<uint8_t>& payload, uint32_t length) {
++  const size_t bytes = size_t{length} * sizeof(char16_t);
++  if (payload.size() < sizeof(T) + bytes) {
++    return std::u16string();
++  }
++  std::u16string text(length, u'\0');
++  std::memcpy(text.data(), payload.data() + sizeof(T), bytes);
++  return text;
++}
++
++// Drag and drop is disabled in the first version: the native OLE loop is
++// driven by the physical mouse and cannot be fed remotely.
++// TODO(cloud_stream, P5): implement an in-process drag session driven by
++// the remote pointer.
++class NoopDragDropClient : public aura::client::DragDropClient {
++ public:
++  ui::mojom::DragOperation StartDragAndDrop(
++      std::unique_ptr<ui::OSExchangeData> data,
++      aura::Window* root_window,
++      aura::Window* source_window,
++      const gfx::Point& screen_location,
++      int allowed_operations,
++      ui::mojom::DragEventSource source) override {
++    return ui::mojom::DragOperation::kNone;
++  }
++  void DragCancel() override {}
++  bool IsDragDropInProgress() override { return false; }
++  void AddObserver(aura::client::DragDropClientObserver* observer) override {}
++  void RemoveObserver(
++      aura::client::DragDropClientObserver* observer) override {}
++};
++
++// Framed windows (browser, app, DevTools) are kNormal; everything else
++// (menus, bubbles, <select>, tooltips, extension popups) is kPopup.
++WindowKind KindForHost(aura::WindowTreeHost* host) {
++  views::Widget* widget =
++      views::Widget::GetWidgetForNativeWindow(host->window());
++  return widget && widget->non_client_view() ? WindowKind::kNormal
++                                             : WindowKind::kPopup;
++}
++
++}  // namespace
++
++// static
++CloudStreamController* CloudStreamController::Get() {
++  return g_controller;
++}
++
++// static
++std::unique_ptr<CloudStreamController> CloudStreamController::MaybeCreate() {
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(switches::kCloudStreamPipe)) {
++    return nullptr;
++  }
++  auto controller = base::WrapUnique(new CloudStreamController(
++      command_line->GetSwitchValueNative(switches::kCloudStreamPipe)));
++  if (!controller->Start()) {
++    return nullptr;
++  }
++  return controller;
++}
++
++CloudStreamController::CloudStreamController(const std::wstring& pipe_name)
++    : pipe_name_(pipe_name),
++      begin_frame_sequence_(viz::BeginFrameArgs::kStartingFrameNumber) {}
++
++CloudStreamController::~CloudStreamController() {
++  streams_.clear();
++  aura::Env::GetInstance()->RemoveObserver(this);
++  views::CloudStreamHooksWin::Set(nullptr);
++  g_controller = nullptr;
++}
++
++bool CloudStreamController::Start() {
++  transport_ = std::make_unique<PipeTransport>(
++      pipe_name_,
++      base::BindRepeating(&CloudStreamController::OnMessage,
++                          weak_factory_.GetWeakPtr()),
++      base::BindOnce(&CloudStreamController::OnDisconnected,
++                     weak_factory_.GetWeakPtr()));
++  if (!transport_->Start()) {
++    return false;
++  }
++  g_controller = this;
++  // Must happen before the first top-level window is created, so that
++  // DesktopWindowTreeHostWin picks up the hooks in Init().
++  views::CloudStreamHooksWin::Set(this);
++  aura::Env::GetInstance()->AddObserver(this);
++  // Runs after ChromeBrowserMainParts installed ChromeSelectFileDialogFactory
++  // (chrome_browser_main.cc), so this replaces it.
++  ui::SelectFileDialog::SetFactory(
++      std::make_unique<CloudSelectFileDialogFactory>());
++  return true;
++}
++
++// --- Window tracking --------------------------------------------------------
++
++void CloudStreamController::OnHostInitialized(aura::WindowTreeHost* host) {
++  const uint32_t id = next_window_id_++;
++  hosts_[id] = host;
++  if (hello_received_) {
++    AnnounceWindow(id, host);
++    StartStream(id, host);
++  }
++}
++
++void CloudStreamController::OnHostDestroyed(aura::WindowTreeHost* host) {
++  const uint32_t id = IdForHost(host);
++  if (!id) {
++    return;
++  }
++  streams_.erase(id);
++  hosts_.erase(id);
++  if (hello_received_) {
++    WindowMessage msg{};
++    msg.window_id = id;
++    transport_->Send(MessageType::kWindowDestroyed, &msg, sizeof(msg));
++  }
++}
++
++void CloudStreamController::AnnounceWindow(uint32_t id,
++                                           aura::WindowTreeHost* host) {
++  WindowMessage msg{};
++  msg.window_id = id;
++  msg.kind = KindForHost(host);
++  if (views::Widget* widget =
++          views::Widget::GetWidgetForNativeWindow(host->window())) {
++    if (views::Widget* parent = widget->parent()) {
++      if (aura::WindowTreeHost* parent_host =
++              parent->GetNativeWindow()->GetHost()) {
++        msg.parent_window_id = IdForHost(parent_host);
++      }
++    }
++  }
++  const gfx::Rect bounds = host->GetBoundsInPixels();
++  msg.x = bounds.x();
++  msg.y = bounds.y();
++  msg.width = bounds.width();
++  msg.height = bounds.height();
++  transport_->Send(MessageType::kWindowCreated, &msg, sizeof(msg));
++}
++
++void CloudStreamController::StartStream(uint32_t id,
++                                        aura::WindowTreeHost* host) {
++  if (!host->compositor()) {
++    return;
++  }
++  streams_[id] = std::make_unique<WindowStream>(
++      id, host, transport_.get(), gateway_process_.get(),
++      kDefaultCapturePeriod);
++}
++
++aura::WindowTreeHost* CloudStreamController::HostForId(uint32_t id) const {
++  auto it = hosts_.find(id);
++  return it == hosts_.end() ? nullptr : it->second.get();
++}
++
++uint32_t CloudStreamController::IdForHost(aura::WindowTreeHost* host) const {
++  for (const auto& [id, h] : hosts_) {
++    if (h == host) {
++      return id;
++    }
++  }
++  return 0;
++}
++
++// --- views::CloudStreamHooksWin ---------------------------------------------
++
++bool CloudStreamController::UseExternalBeginFrameControl() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      switches::kCloudStreamExternalBeginFrame);
++}
++
++void CloudStreamController::OnCursorChanged(aura::WindowTreeHost* host,
++                                            const ui::Cursor& cursor) {
++  if (!hello_received_) {
++    return;
++  }
++  CursorMessage msg{};
++  msg.window_id = IdForHost(host);
++  msg.cursor_type = static_cast<uint32_t>(cursor.type());
++  if (cursor.type() != ui::mojom::CursorType::kCustom) {
++    transport_->Send(MessageType::kCursor, &msg, sizeof(msg));
++    return;
++  }
++  const SkBitmap& bitmap = cursor.custom_bitmap();
++  msg.width = bitmap.width();
++  msg.height = bitmap.height();
++  msg.hotspot_x = cursor.custom_hotspot().x();
++  msg.hotspot_y = cursor.custom_hotspot().y();
++  // Custom cursor bitmaps are N32 (BGRA on Windows).
++  transport_->Send(MessageType::kCursor, &msg, sizeof(msg), bitmap.getPixels(),
++                   static_cast<uint32_t>(bitmap.computeByteSize()));
++}
++
++std::unique_ptr<aura::client::DragDropClient>
++CloudStreamController::CreateDragDropClient(aura::WindowTreeHost* host) {
++  return std::make_unique<NoopDragDropClient>();
++}
++
++// --- Transport --------------------------------------------------------------
++
++void CloudStreamController::OnMessage(MessageType type,
++                                      std::vector<uint8_t> payload) {
++  switch (type) {
++    case MessageType::kHello: {
++      HelloMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        HandleHello(msg);
++      }
++      break;
++    }
++    case MessageType::kBeginFrame: {
++      BeginFrameMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        HandleBeginFrame(msg);
++      }
++      break;
++    }
++    case MessageType::kFrameDone: {
++      FrameDoneMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        HandleFrameDone(msg);
++      }
++      break;
++    }
++    case MessageType::kSetWindowBounds: {
++      WindowBoundsMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        HandleSetWindowBounds(msg);
++      }
++      break;
++    }
++    case MessageType::kFileChosen: {
++      FileChosenMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        HandleFileChosen(msg, ReadTail<FileChosenMessage>(payload, msg.length));
++      }
++      break;
++    }
++    case MessageType::kMouse:
++    case MessageType::kWheel:
++    case MessageType::kKey:
++    case MessageType::kText:
++    case MessageType::kComposition:
++      // TODO(cloud_stream): remote input, see remote_input.h and
++      // docs/architecture.md section 3.6. Not implemented in this patch.
++      break;
++    case MessageType::kClipboardText:
++      // TODO(cloud_stream): bridge to the headless clipboard.
++      break;
++    default:
++      LOG(WARNING) << "cloud_stream: unexpected message "
++                   << static_cast<uint32_t>(type);
++      break;
++  }
++}
++
++void CloudStreamController::OnDisconnected() {
++  LOG(ERROR) << "cloud_stream: gateway disconnected";
++  streams_.clear();
++  hello_received_ = false;
++}
++
++void CloudStreamController::HandleHello(const HelloMessage& msg) {
++  if (msg.protocol_version != kProtocolVersion || hello_received_) {
++    return;
++  }
++  gateway_process_.Set(
++      ::OpenProcess(PROCESS_DUP_HANDLE, FALSE, msg.gateway_pid));
++  if (!gateway_process_.is_valid()) {
++    PLOG(ERROR) << "cloud_stream: cannot open gateway process";
++    return;
++  }
++  hello_received_ = true;
++
++  HelloAckMessage ack{kProtocolVersion, ::GetCurrentProcessId()};
++  transport_->Send(MessageType::kHelloAck, &ack, sizeof(ack));
++
++  // Announce windows created before the gateway connected, parents first
++  // (ids are increasing in creation order).
++  for (const auto& [id, host] : hosts_) {
++    AnnounceWindow(id, host);
++    StartStream(id, host);
++  }
++}
++
++void CloudStreamController::HandleBeginFrame(const BeginFrameMessage& msg) {
++  if (!UseExternalBeginFrameControl()) {
++    return;
++  }
++  const base::TimeTicks frame_time =
++      base::TimeTicks() + base::Microseconds(msg.frame_time_us);
++  const base::TimeDelta interval = base::Microseconds(msg.interval_us);
++  auto issue = [&](aura::WindowTreeHost* host) {
++    if (!host->compositor()) {
++      return;
++    }
++    auto args = viz::BeginFrameArgs::Create(
++        BEGINFRAME_FROM_HERE, viz::BeginFrameArgs::kManualSourceId,
++        begin_frame_sequence_++, frame_time, frame_time + interval, interval,
++        viz::BeginFrameArgs::NORMAL);
++    host->compositor()->IssueExternalBeginFrame(args, base::DoNothing());
++  };
++  if (msg.window_id == 0) {
++    for (const auto& [id, host] : hosts_) {
++      issue(host);
++    }
++  } else if (aura::WindowTreeHost* host = HostForId(msg.window_id)) {
++    issue(host);
++  }
++}
++
++void CloudStreamController::HandleFrameDone(const FrameDoneMessage& msg) {
++  auto it = streams_.find(msg.window_id);
++  if (it != streams_.end()) {
++    it->second->OnFrameDone(msg.frame_seq);
++  }
++}
++
++void CloudStreamController::HandleSetWindowBounds(
++    const WindowBoundsMessage& msg) {
++  if (aura::WindowTreeHost* host = HostForId(msg.window_id)) {
++    host->SetBoundsInPixels(
++        gfx::Rect(msg.x, msg.y, msg.width, msg.height));
++  }
++}
++
++// --- File chooser -----------------------------------------------------------
++
++void CloudStreamController::RequestFileChooser(gfx::NativeWindow owning_window,
++                                               FileChooserMode mode,
++                                               const std::u16string& title,
++                                               FileChooserCallback callback) {
++  if (!hello_received_) {
++    std::move(callback).Run(/*canceled=*/true, {});
++    return;
++  }
++  const uint32_t request_id = next_file_request_id_++;
++  file_requests_[request_id] = std::move(callback);
++
++  FileChooserRequestMessage msg{};
++  msg.request_id = request_id;
++  msg.window_id = owning_window && owning_window->GetHost()
++                      ? IdForHost(owning_window->GetHost())
++                      : 0;
++  msg.mode = mode;
++  msg.title_length = static_cast<uint32_t>(title.size());
++  transport_->Send(MessageType::kFileChooserRequest, &msg, sizeof(msg),
++                   title.data(),
++                   static_cast<uint32_t>(title.size() * sizeof(char16_t)));
++}
++
++void CloudStreamController::HandleFileChosen(const FileChosenMessage& msg,
++                                             const std::u16string& paths) {
++  auto it = file_requests_.find(msg.request_id);
++  if (it == file_requests_.end()) {
++    return;
++  }
++  FileChooserCallback callback = std::move(it->second);
++  file_requests_.erase(it);
++
++  std::vector<base::FilePath> files;
++  if (!msg.canceled) {
++    for (const auto& path :
++         base::SplitString(paths, std::u16string(1, u'\0'),
++                           base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++      files.emplace_back(base::AsWStringView(path));
++    }
++  }
++  std::move(callback).Run(msg.canceled != 0, std::move(files));
++}
++
++}  // namespace cloud_stream
+diff --git a/chrome/browser/cloud_stream/cloud_stream_controller.h b/chrome/browser/cloud_stream/cloud_stream_controller.h
+new file mode 100644
+index 00000000..782f5b01
+--- /dev/null
++++ b/chrome/browser/cloud_stream/cloud_stream_controller.h
+@@ -0,0 +1,119 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CLOUD_STREAM_CLOUD_STREAM_CONTROLLER_H_
++#define CHROME_BROWSER_CLOUD_STREAM_CLOUD_STREAM_CONTROLLER_H_
++
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "base/win/scoped_handle.h"
++#include "chrome/browser/cloud_stream/public/cloud_stream_protocol.h"
++#include "ui/aura/env_observer.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/views/widget/desktop_aura/cloud_stream_hooks_win.h"
++
++namespace aura {
++class WindowTreeHost;
++}  // namespace aura
++
++namespace cloud_stream {
++
++class PipeTransport;
++class WindowStream;
++
++// Browser-process side of cloud streaming mode (--cloud-stream-pipe).
++//
++//  * Tracks every top-level aura::WindowTreeHost (browser windows, menus,
++//    bubbles, popups) and announces them to the gateway.
++//  * Owns one WindowStream (frame capture) per host once the gateway said
++//    hello.
++//  * Implements the views hooks: external BeginFrame, cursor, drag and drop.
++//  * Serves remote file chooser requests for CloudSelectFileDialog.
++//
++// Lives on the UI thread. Created in
++// ChromeBrowserMainExtraPartsHeadless::PreBrowserStart().
++class CloudStreamController : public aura::EnvObserver,
++                              public views::CloudStreamHooksWin {
++ public:
++  using FileChooserCallback =
++      base::OnceCallback<void(bool canceled, std::vector<base::FilePath>)>;
++
++  // Returns nullptr unless running in cloud streaming mode.
++  static CloudStreamController* Get();
++
++  // Creates and starts the controller if --cloud-stream-pipe is present.
++  static std::unique_ptr<CloudStreamController> MaybeCreate();
++
++  CloudStreamController(const CloudStreamController&) = delete;
++  CloudStreamController& operator=(const CloudStreamController&) = delete;
++  ~CloudStreamController() override;
++
++  // Called by CloudSelectFileDialog.
++  void RequestFileChooser(gfx::NativeWindow owning_window,
++                          FileChooserMode mode,
++                          const std::u16string& title,
++                          FileChooserCallback callback);
++
++ private:
++  explicit CloudStreamController(const std::wstring& pipe_name);
++  bool Start();
++
++  // aura::EnvObserver:
++  void OnHostInitialized(aura::WindowTreeHost* host) override;
++  void OnHostDestroyed(aura::WindowTreeHost* host) override;
++
++  // views::CloudStreamHooksWin:
++  bool UseExternalBeginFrameControl() override;
++  void OnCursorChanged(aura::WindowTreeHost* host,
++                       const ui::Cursor& cursor) override;
++  std::unique_ptr<aura::client::DragDropClient> CreateDragDropClient(
++      aura::WindowTreeHost* host) override;
++
++  // Transport.
++  void OnMessage(MessageType type, std::vector<uint8_t> payload);
++  void OnDisconnected();
++
++  // Message handlers.
++  void HandleHello(const HelloMessage& msg);
++  void HandleBeginFrame(const BeginFrameMessage& msg);
++  void HandleFrameDone(const FrameDoneMessage& msg);
++  void HandleSetWindowBounds(const WindowBoundsMessage& msg);
++  void HandleFileChosen(const FileChosenMessage& msg,
++                        const std::u16string& paths);
++
++  void AnnounceWindow(uint32_t id, aura::WindowTreeHost* host);
++  void StartStream(uint32_t id, aura::WindowTreeHost* host);
++  aura::WindowTreeHost* HostForId(uint32_t id) const;
++  uint32_t IdForHost(aura::WindowTreeHost* host) const;
++
++  const std::wstring pipe_name_;
++  std::unique_ptr<PipeTransport> transport_;
++
++  // Set after kHello. Frame handles are duplicated into this process.
++  base::win::ScopedHandle gateway_process_;
++  bool hello_received_ = false;
++
++  uint32_t next_window_id_ = 1;
++  std::map<uint32_t, raw_ptr<aura::WindowTreeHost>> hosts_;
++  std::map<uint32_t, std::unique_ptr<WindowStream>> streams_;
++
++  uint64_t begin_frame_sequence_;
++
++  uint32_t next_file_request_id_ = 1;
++  std::map<uint32_t, FileChooserCallback> file_requests_;
++
++  base::WeakPtrFactory<CloudStreamController> weak_factory_{this};
++};
++
++}  // namespace cloud_stream
++
++#endif  // CHROME_BROWSER_CLOUD_STREAM_CLOUD_STREAM_CONTROLLER_H_
+diff --git a/chrome/browser/cloud_stream/pipe_transport.cc b/chrome/browser/cloud_stream/pipe_transport.cc
+new file mode 100644
+index 00000000..03fa4c8b
+--- /dev/null
++++ b/chrome/browser/cloud_stream/pipe_transport.cc
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/cloud_stream/pipe_transport.h"
++
++#include <windows.h>
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/task/sequenced_task_runner.h"
++
++namespace cloud_stream {
++
++namespace {
++
++// Upper bound for a single payload, to reject a corrupt stream early.
++constexpr uint32_t kMaxPayloadSize = 16 * 1024 * 1024;
++
++bool ReadAll(HANDLE pipe, void* data, uint32_t size) {
++  auto* p = static_cast<uint8_t*>(data);
++  while (size > 0) {
++    DWORD read = 0;
++    if (!::ReadFile(pipe, p, size, &read, nullptr) || read == 0) {
++      return false;
++    }
++    p += read;
++    size -= read;
++  }
++  return true;
++}
++
++}  // namespace
++
++PipeTransport::PipeTransport(const std::wstring& pipe_name,
++                             MessageCallback on_message,
++                             base::OnceClosure on_disconnected)
++    : pipe_name_(pipe_name),
++      on_message_(std::move(on_message)),
++      on_disconnected_(std::move(on_disconnected)),
++      ui_task_runner_(base::SequencedTaskRunner::GetCurrentDefault()),
++      read_thread_("CloudStreamPipeRead") {}
++
++PipeTransport::~PipeTransport() {
++  // Closing the handle unblocks ReadFile on the read thread.
++  pipe_.Close();
++  read_thread_.Stop();
++}
++
++bool PipeTransport::Start() {
++  const std::wstring path = L"\\\\.\\pipe\\" + pipe_name_;
++  pipe_.Set(::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
++                          nullptr, OPEN_EXISTING, 0, nullptr));
++  if (!pipe_.is_valid()) {
++    PLOG(ERROR) << "cloud_stream: cannot open pipe";
++    return false;
++  }
++  DWORD mode = PIPE_READMODE_BYTE;
++  ::SetNamedPipeHandleState(pipe_.get(), &mode, nullptr, nullptr);
++
++  if (!read_thread_.Start()) {
++    return false;
++  }
++  read_thread_.task_runner()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&PipeTransport::ReadLoop, base::Unretained(this)));
++  return true;
++}
++
++void PipeTransport::ReadLoop() {
++  for (;;) {
++    MessageHeader header;
++    if (!ReadAll(pipe_.get(), &header, sizeof(header)) ||
++        header.payload_size > kMaxPayloadSize) {
++      break;
++    }
++    std::vector<uint8_t> payload(header.payload_size);
++    if (header.payload_size &&
++        !ReadAll(pipe_.get(), payload.data(), header.payload_size)) {
++      break;
++    }
++    ui_task_runner_->PostTask(
++        FROM_HERE, base::BindOnce(on_message_, header.type, std::move(payload)));
++  }
++  if (on_disconnected_) {
++    ui_task_runner_->PostTask(FROM_HERE, std::move(on_disconnected_));
++  }
++}
++
++bool PipeTransport::WriteAll(const void* data, uint32_t size) {
++  auto* p = static_cast<const uint8_t*>(data);
++  while (size > 0) {
++    DWORD written = 0;
++    if (!::WriteFile(pipe_.get(), p, size, &written, nullptr) ||
++        written == 0) {
++      return false;
++    }
++    p += written;
++    size -= written;
++  }
++  return true;
++}
++
++bool PipeTransport::Send(MessageType type,
++                         const void* payload,
++                         uint32_t payload_size) {
++  return Send(type, payload, payload_size, nullptr, 0);
++}
++
++bool PipeTransport::Send(MessageType type,
++                         const void* payload,
++                         uint32_t payload_size,
++                         const void* tail,
++                         uint32_t tail_size) {
++  base::AutoLock lock(write_lock_);
++  if (!pipe_.is_valid()) {
++    return false;
++  }
++  MessageHeader header{type, payload_size + tail_size};
++  return WriteAll(&header, sizeof(header)) &&
++         (!payload_size || WriteAll(payload, payload_size)) &&
++         (!tail_size || WriteAll(tail, tail_size));
++}
++
++}  // namespace cloud_stream
+diff --git a/chrome/browser/cloud_stream/pipe_transport.h b/chrome/browser/cloud_stream/pipe_transport.h
+new file mode 100644
+index 00000000..0a103237
+--- /dev/null
++++ b/chrome/browser/cloud_stream/pipe_transport.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CLOUD_STREAM_PIPE_TRANSPORT_H_
++#define CHROME_BROWSER_CLOUD_STREAM_PIPE_TRANSPORT_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/threading/thread.h"
++#include "base/win/scoped_handle.h"
++#include "chrome/browser/cloud_stream/public/cloud_stream_protocol.h"
++
++namespace cloud_stream {
++
++// Duplex named pipe to the gateway. Reads run on a dedicated thread and are
++// posted back to the UI thread; writes may be issued from the UI thread and
++// are serialized with a lock.
++class PipeTransport {
++ public:
++  using MessageCallback =
++      base::RepeatingCallback<void(MessageType type,
++                                   std::vector<uint8_t> payload)>;
++
++  PipeTransport(const std::wstring& pipe_name,
++                MessageCallback on_message,
++                base::OnceClosure on_disconnected);
++  PipeTransport(const PipeTransport&) = delete;
++  PipeTransport& operator=(const PipeTransport&) = delete;
++  ~PipeTransport();
++
++  // Connects and starts the read thread. Returns false if the pipe cannot be
++  // opened.
++  bool Start();
++
++  // Sends one message. Safe to call from any thread.
++  bool Send(MessageType type, const void* payload, uint32_t payload_size);
++  bool Send(MessageType type,
++            const void* payload,
++            uint32_t payload_size,
++            const void* tail,
++            uint32_t tail_size);
++
++ private:
++  void ReadLoop();
++  bool WriteAll(const void* data, uint32_t size);
++
++  const std::wstring pipe_name_;
++  MessageCallback on_message_;
++  base::OnceClosure on_disconnected_;
++  scoped_refptr<base::SequencedTaskRunner> ui_task_runner_;
++
++  base::win::ScopedHandle pipe_;
++  base::Lock write_lock_;
++  base::Thread read_thread_;
++};
++
++}  // namespace cloud_stream
++
++#endif  // CHROME_BROWSER_CLOUD_STREAM_PIPE_TRANSPORT_H_
+diff --git a/chrome/browser/cloud_stream/public/cloud_stream_protocol.h b/chrome/browser/cloud_stream/public/cloud_stream_protocol.h
+new file mode 100644
+index 00000000..f4b441db
+--- /dev/null
++++ b/chrome/browser/cloud_stream/public/cloud_stream_protocol.h
+@@ -0,0 +1,226 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CLOUD_STREAM_PUBLIC_CLOUD_STREAM_PROTOCOL_H_
++#define CHROME_BROWSER_CLOUD_STREAM_PUBLIC_CLOUD_STREAM_PROTOCOL_H_
++
++// Wire protocol between a Chrome instance running with --cloud-stream-pipe
++// and the streaming gateway. This header has no Chromium dependencies so the
++// gateway can include the same file.
++//
++// Transport: one duplex named pipe per Chrome instance, created by the
++// gateway (\\.\pipe\<name>), opened by Chrome. Every message is a
++// MessageHeader followed by `payload_size` bytes. All integers are
++// little-endian, all coordinates are in window pixels.
++
++#include <stdint.h>
++
++namespace cloud_stream {
++
++inline constexpr uint32_t kProtocolVersion = 1;
++
++enum class MessageType : uint32_t {
++  // Gateway -> Chrome.
++  kHello = 1,             // HelloMessage
++  kMouse = 10,            // MouseMessage
++  kWheel = 11,            // WheelMessage
++  kKey = 12,              // KeyMessage
++  kText = 13,             // TextMessage + UTF-16 text
++  kComposition = 14,      // CompositionMessage + UTF-16 text
++  kBeginFrame = 20,       // BeginFrameMessage
++  kFrameDone = 21,        // FrameDoneMessage
++  kSetWindowBounds = 22,  // WindowBoundsMessage
++  kFileChosen = 30,       // FileChosenMessage + UTF-16 paths ('\0' separated)
++  kClipboardText = 31,    // ClipboardMessage + UTF-16 text
++
++  // Chrome -> gateway.
++  kHelloAck = 100,          // HelloAckMessage
++  kWindowCreated = 110,     // WindowMessage
++  kWindowDestroyed = 111,   // WindowMessage
++  kWindowBounds = 112,      // WindowBoundsMessage
++  kFrame = 120,             // FrameMessage
++  kCursor = 130,            // CursorMessage [+ BGRA pixels]
++  kFileChooserRequest = 140,  // FileChooserRequestMessage + UTF-16 title
++  kClipboardChanged = 141,  // ClipboardMessage + UTF-16 text
++};
++
++#pragma pack(push, 1)
++
++struct MessageHeader {
++  MessageType type;
++  uint32_t payload_size;
++};
++
++// --- Gateway -> Chrome -----------------------------------------------------
++
++struct HelloMessage {
++  uint32_t protocol_version;
++  // Gateway process id. Chrome duplicates frame handles into this process.
++  uint32_t gateway_pid;
++  // DXGI adapter LUID the gateway encodes on. Must match --use-adapter-luid.
++  uint32_t adapter_luid_low;
++  int32_t adapter_luid_high;
++};
++
++enum class MouseAction : uint32_t {
++  kMove = 0,
++  kDown = 1,
++  kUp = 2,
++  kEnter = 3,
++  kLeave = 4,
++};
++
++// Bit values match ui::EventFlags so Chrome can pass them through.
++enum Modifier : uint32_t {
++  kShift = 1 << 1,
++  kControl = 1 << 2,
++  kAlt = 1 << 3,
++  kCommand = 1 << 4,  // Windows key.
++  kLeftButton = 1 << 6,
++  kMiddleButton = 1 << 7,
++  kRightButton = 1 << 8,
++};
++
++struct MouseMessage {
++  uint32_t window_id;
++  MouseAction action;
++  int32_t x;
++  int32_t y;
++  uint32_t modifiers;       // Modifier bits, including held buttons.
++  uint32_t changed_button;  // kLeftButton/kMiddleButton/kRightButton or 0.
++  uint32_t click_count;     // For kDown: 1, 2, 3...
++};
++
++struct WheelMessage {
++  uint32_t window_id;
++  int32_t x;
++  int32_t y;
++  int32_t delta_x;  // Multiples of 120 per notch, like WM_MOUSEWHEEL.
++  int32_t delta_y;
++  uint32_t modifiers;
++};
++
++struct KeyMessage {
++  uint32_t window_id;
++  uint32_t pressed;      // 1 = key down, 0 = key up.
++  uint32_t windows_vk;   // Windows virtual-key code (VK_*).
++  uint32_t scan_code;    // PS/2 set 1 scan code, extended keys | 0xE000.
++  uint32_t modifiers;
++};
++
++// Committed text, typed characters or IME result. Followed by
++// `length` UTF-16 code units.
++struct TextMessage {
++  uint32_t window_id;
++  uint32_t length;
++};
++
++// In-progress IME composition. Followed by `length` UTF-16 code units.
++// length == 0 clears the composition.
++struct CompositionMessage {
++  uint32_t window_id;
++  uint32_t length;
++  uint32_t cursor;  // Caret position inside the composition.
++};
++
++struct BeginFrameMessage {
++  uint32_t window_id;  // 0 = all windows.
++  int64_t frame_time_us;
++  int64_t interval_us;
++};
++
++struct FrameDoneMessage {
++  uint32_t window_id;
++  uint64_t frame_seq;
++};
++
++struct WindowBoundsMessage {
++  uint32_t window_id;
++  int32_t x;
++  int32_t y;
++  int32_t width;
++  int32_t height;
++};
++
++struct FileChosenMessage {
++  uint32_t request_id;
++  uint32_t canceled;  // 1 = user canceled.
++  uint32_t length;    // UTF-16 code units of the path list that follows.
++};
++
++struct ClipboardMessage {
++  uint32_t length;  // UTF-16 code units that follow.
++};
++
++// --- Chrome -> gateway -----------------------------------------------------
++
++struct HelloAckMessage {
++  uint32_t protocol_version;
++  uint32_t chrome_pid;
++};
++
++enum class WindowKind : uint32_t {
++  kNormal = 0,  // Browser window or app window.
++  kPopup = 1,   // Menus, bubbles, <select>, tooltips, extension popups.
++};
++
++struct WindowMessage {
++  uint32_t window_id;
++  WindowKind kind;
++  uint32_t parent_window_id;  // 0 if none.
++  int32_t x;
++  int32_t y;
++  int32_t width;
++  int32_t height;
++};
++
++struct FrameMessage {
++  uint32_t window_id;
++  uint64_t frame_seq;
++  // NT handle to a D3D11 texture, already duplicated into the gateway
++  // process. 0 if `texture_token` refers to a texture sent before; the
++  // gateway caches opened textures by token.
++  uint64_t texture_handle;
++  uint64_t texture_token_high;
++  uint64_t texture_token_low;
++  uint32_t coded_width;
++  uint32_t coded_height;
++  int32_t visible_x;
++  int32_t visible_y;
++  uint32_t visible_width;
++  uint32_t visible_height;
++  int64_t timestamp_us;
++  // The gateway must answer every frame with kFrameDone, otherwise the
++  // capturer runs out of buffers.
++};
++
++struct CursorMessage {
++  uint32_t window_id;
++  uint32_t cursor_type;  // ui::mojom::CursorType value.
++  // For custom cursors (cursor_type == kCustom): BGRA pixels follow.
++  uint32_t width;
++  uint32_t height;
++  int32_t hotspot_x;
++  int32_t hotspot_y;
++};
++
++enum class FileChooserMode : uint32_t {
++  kOpen = 0,
++  kOpenMultiple = 1,
++  kFolder = 2,
++  kSave = 3,
++};
++
++struct FileChooserRequestMessage {
++  uint32_t request_id;
++  uint32_t window_id;
++  FileChooserMode mode;
++  uint32_t title_length;  // UTF-16 code units that follow.
++};
++
++#pragma pack(pop)
++
++}  // namespace cloud_stream
++
++#endif  // CHROME_BROWSER_CLOUD_STREAM_PUBLIC_CLOUD_STREAM_PROTOCOL_H_
+diff --git a/chrome/browser/cloud_stream/remote_input.h b/chrome/browser/cloud_stream/remote_input.h
+new file mode 100644
+index 00000000..56521dc8
+--- /dev/null
++++ b/chrome/browser/cloud_stream/remote_input.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CLOUD_STREAM_REMOTE_INPUT_H_
++#define CHROME_BROWSER_CLOUD_STREAM_REMOTE_INPUT_H_
++
++#include <string>
++
++#include "chrome/browser/cloud_stream/public/cloud_stream_protocol.h"
++
++namespace aura {
++class WindowTreeHost;
++}  // namespace aura
++
++namespace cloud_stream {
++
++// Converts protocol input messages into ui::Events and feeds them to a
++// window's aura event sink, the same entry point DesktopWindowTreeHostWin
++// uses for native window messages. Views (tab strip, omnibox, menus) and web
++// contents therefore handle them exactly like local input, independent of
++// the single Windows input focus.
++class RemoteInput {
++ public:
++  static void DispatchMouse(aura::WindowTreeHost* host,
++                            const MouseMessage& msg);
++  static void DispatchWheel(aura::WindowTreeHost* host,
++                            const WheelMessage& msg);
++
++  // Key down / up for non-text keys and shortcuts. This does not insert
++  // characters: on Windows the input method reads WM_CHAR from the real
++  // message queue, which a synthesized key down never populates. Printable
++  // text and IME results come through CommitText instead.
++  static void DispatchKey(aura::WindowTreeHost* host, const KeyMessage& msg);
++
++  // Inserts committed text (typed characters or an IME result) through the
++  // focused TextInputClient.
++  static void CommitText(aura::WindowTreeHost* host, const std::u16string& t);
++
++  // Sets or clears the in-progress IME composition.
++  static void SetComposition(aura::WindowTreeHost* host,
++                             const std::u16string& text,
++                             uint32_t cursor);
++};
++
++}  // namespace cloud_stream
++
++#endif  // CHROME_BROWSER_CLOUD_STREAM_REMOTE_INPUT_H_
+diff --git a/chrome/browser/cloud_stream/window_stream.cc b/chrome/browser/cloud_stream/window_stream.cc
+new file mode 100644
+index 00000000..72541d2a
+--- /dev/null
++++ b/chrome/browser/cloud_stream/window_stream.cc
+@@ -0,0 +1,163 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/cloud_stream/window_stream.h"
++
++#include <windows.h>
++
++#include <utility>
++
++#include "base/logging.h"
++#include "chrome/browser/cloud_stream/pipe_transport.h"
++#include "chrome/browser/cloud_stream/public/cloud_stream_protocol.h"
++#include "components/viz/common/surfaces/video_capture_target.h"
++#include "components/viz/host/host_frame_sink_manager.h"
++#include "media/base/video_types.h"
++#include "ui/aura/window_tree_host.h"
++#include "ui/compositor/compositor.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++
++namespace cloud_stream {
++
++WindowStream::WindowStream(uint32_t window_id,
++                           aura::WindowTreeHost* host,
++                           PipeTransport* transport,
++                           HANDLE gateway_process,
++                           base::TimeDelta min_capture_period)
++    : window_id_(window_id),
++      host_(host),
++      transport_(transport),
++      gateway_process_(gateway_process) {
++  host_->AddObserver(this);
++
++  ui::Compositor* compositor = host_->compositor();
++  viz::HostFrameSinkManager* frame_sink_manager =
++      compositor->context_factory()->GetHostFrameSinkManager();
++  capturer_ = frame_sink_manager->CreateVideoCapturer();
++
++  // ARGB with a native handle: the frame stays a D3D11 texture on the GPU
++  // and is delivered as a DXGI NT handle. NV12 is only allowed with mappable
++  // shared images, which would force a CPU-visible copy.
++  capturer_->SetFormat(media::PIXEL_FORMAT_ARGB);
++  capturer_->SetMinCapturePeriod(min_capture_period);
++  capturer_->SetMinSizeChangePeriod(base::TimeDelta());
++  capturer_->SetAutoThrottlingEnabled(false);
++  UpdateResolution();
++  capturer_->ChangeTarget(viz::VideoCaptureTarget(compositor->frame_sink_id()));
++  capturer_->Start(
++      this,
++      viz::mojom::BufferFormatPreference::kPreferSharedImageWithNativeHandle);
++
++  SendBounds();
++}
++
++WindowStream::~WindowStream() {
++  capturer_->StopAndResetConsumer();
++  in_flight_.clear();  // Dropping the remotes releases the buffers.
++  host_->RemoveObserver(this);
++}
++
++void WindowStream::UpdateResolution() {
++  // Capture at the window's native pixel size, no scaling.
++  const gfx::Size size = host_->GetBoundsInPixels().size();
++  if (size.IsEmpty()) {
++    return;
++  }
++  capturer_->SetResolutionConstraints(size, size,
++                                      /*use_fixed_aspect_ratio=*/true);
++}
++
++void WindowStream::SendBounds() {
++  const gfx::Rect bounds = host_->GetBoundsInPixels();
++  WindowBoundsMessage msg{window_id_, bounds.x(), bounds.y(), bounds.width(),
++                          bounds.height()};
++  transport_->Send(MessageType::kWindowBounds, &msg, sizeof(msg));
++}
++
++void WindowStream::OnHostResized(aura::WindowTreeHost* host) {
++  UpdateResolution();
++  SendBounds();
++}
++
++void WindowStream::OnHostMovedInPixels(aura::WindowTreeHost* host) {
++  SendBounds();
++}
++
++void WindowStream::RequestRefreshFrame() {
++  capturer_->RequestRefreshFrame();
++}
++
++void WindowStream::OnFrameCaptured(
++    media::mojom::VideoBufferHandlePtr data,
++    media::mojom::VideoFrameInfoPtr info,
++    const gfx::Rect& content_rect,
++    mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
++        callbacks) {
++  mojo::Remote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks> done(
++      std::move(callbacks));
++
++  if (!data->is_gpu_memory_buffer_handle()) {
++    // Software compositing fallback delivers shared memory frames. Not
++    // supported by this transport yet; release the buffer immediately.
++    // TODO(cloud_stream): forward shmem frames for the degraded mode.
++    LOG_FIRST_N(WARNING, 1) << "cloud_stream: non-GPU frame, dropping";
++    return;
++  }
++  const gfx::GpuMemoryBufferHandle& gmb =
++      data->get_gpu_memory_buffer_handle();
++  if (gmb.type != gfx::DXGI_SHARED_HANDLE) {
++    return;
++  }
++  const gfx::DXGIHandle& dxgi = gmb.dxgi_handle();
++  const base::Token& token = dxgi.token().value();
++  const auto token_key = std::make_pair(token.high(), token.low());
++
++  // Duplicate the texture handle into the gateway only the first time we see
++  // this pool texture.
++  HANDLE remote_handle = nullptr;
++  if (!known_tokens_.contains(token_key)) {
++    if (!::DuplicateHandle(::GetCurrentProcess(), dxgi.buffer_handle(),
++                           gateway_process_, &remote_handle, 0, FALSE,
++                           DUPLICATE_SAME_ACCESS)) {
++      PLOG(ERROR) << "cloud_stream: DuplicateHandle failed";
++      return;
++    }
++    known_tokens_[token_key] = true;
++  }
++
++  // TODO(cloud_stream, P6): on devices with D3DSharedFence support the
++  // texture has no keyed mutex and the blit may still be in flight. Verify on
++  // hardware; if frames tear, export the fence alongside the frame.
++
++  const uint64_t seq = next_frame_seq_++;
++  FrameMessage msg{};
++  msg.window_id = window_id_;
++  msg.frame_seq = seq;
++  msg.texture_handle = reinterpret_cast<uint64_t>(remote_handle);
++  msg.texture_token_high = token.high();
++  msg.texture_token_low = token.low();
++  msg.coded_width = info->coded_size.width();
++  msg.coded_height = info->coded_size.height();
++  msg.visible_x = content_rect.x();
++  msg.visible_y = content_rect.y();
++  msg.visible_width = content_rect.width();
++  msg.visible_height = content_rect.height();
++  msg.timestamp_us = info->timestamp.InMicroseconds();
++
++  if (!transport_->Send(MessageType::kFrame, &msg, sizeof(msg))) {
++    return;  // `done` goes out of scope and releases the buffer.
++  }
++  in_flight_.emplace(seq, std::move(done));
++}
++
++void WindowStream::OnFrameDone(uint64_t frame_seq) {
++  auto it = in_flight_.find(frame_seq);
++  if (it == in_flight_.end()) {
++    return;
++  }
++  it->second->Done();
++  in_flight_.erase(it);
++}
++
++}  // namespace cloud_stream
+diff --git a/chrome/browser/cloud_stream/window_stream.h b/chrome/browser/cloud_stream/window_stream.h
+new file mode 100644
+index 00000000..b512178b
+--- /dev/null
++++ b/chrome/browser/cloud_stream/window_stream.h
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CLOUD_STREAM_WINDOW_STREAM_H_
++#define CHROME_BROWSER_CLOUD_STREAM_WINDOW_STREAM_H_
++
++#include <map>
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "components/viz/host/client_frame_sink_video_capturer.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom.h"
++#include "ui/aura/window_tree_host_observer.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace aura {
++class WindowTreeHost;
++}  // namespace aura
++
++namespace cloud_stream {
++
++class PipeTransport;
++
++// Streams one top-level aura window (browser window, menu, bubble, popup) to
++// the gateway. Owns a FrameSinkVideoCapturer targeting the root frame sink of
++// the host's ui::Compositor, the same way AuraWindowVideoCaptureDevice does,
++// and forwards each captured D3D11 texture to the gateway by NT handle.
++class WindowStream : public viz::mojom::FrameSinkVideoConsumer,
++                     public aura::WindowTreeHostObserver {
++ public:
++  WindowStream(uint32_t window_id,
++               aura::WindowTreeHost* host,
++               PipeTransport* transport,
++               HANDLE gateway_process,
++               base::TimeDelta min_capture_period);
++  WindowStream(const WindowStream&) = delete;
++  WindowStream& operator=(const WindowStream&) = delete;
++  ~WindowStream() override;
++
++  uint32_t window_id() const { return window_id_; }
++  aura::WindowTreeHost* host() const { return host_; }
++
++  // Gateway finished with `frame_seq`; returns the buffer to the capturer.
++  void OnFrameDone(uint64_t frame_seq);
++
++  // Asks the capturer for a frame even if nothing changed (e.g. a new client
++  // joined and needs a key frame).
++  void RequestRefreshFrame();
++
++ private:
++  // viz::mojom::FrameSinkVideoConsumer:
++  void OnFrameCaptured(
++      media::mojom::VideoBufferHandlePtr data,
++      media::mojom::VideoFrameInfoPtr info,
++      const gfx::Rect& content_rect,
++      mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
++          callbacks) override;
++  void OnNewCaptureVersion(
++      const media::CaptureVersion& capture_version) override {}
++  void OnFrameWithEmptyRegionCapture() override {}
++  void OnStopped() override {}
++  void OnLog(const std::string& message) override {}
++
++  // aura::WindowTreeHostObserver:
++  void OnHostResized(aura::WindowTreeHost* host) override;
++  void OnHostMovedInPixels(aura::WindowTreeHost* host) override;
++
++  void UpdateResolution();
++  void SendBounds();
++
++  const uint32_t window_id_;
++  const raw_ptr<aura::WindowTreeHost> host_;
++  const raw_ptr<PipeTransport> transport_;
++  // Owned by the controller; used as DuplicateHandle target.
++  const HANDLE gateway_process_;
++
++  std::unique_ptr<viz::ClientFrameSinkVideoCapturer> capturer_;
++
++  uint64_t next_frame_seq_ = 1;
++  // Frames handed to the gateway and not yet released.
++  std::map<uint64_t,
++           mojo::Remote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>>
++      in_flight_;
++  // Tokens of textures the gateway already has a handle for. The capturer
++  // reuses a small pool, so each texture is duplicated only once.
++  std::map<std::pair<uint64_t, uint64_t>, bool> known_tokens_;
++};
++
++}  // namespace cloud_stream
++
++#endif  // CHROME_BROWSER_CLOUD_STREAM_WINDOW_STREAM_H_
+diff --git a/chrome/browser/headless/BUILD.gn b/chrome/browser/headless/BUILD.gn
+index f5601a31..419330a7 100644
+--- a/chrome/browser/headless/BUILD.gn
++++ b/chrome/browser/headless/BUILD.gn
+@@ -95,6 +95,10 @@ if (!is_android) {
+       "//chrome/browser:main_extra_parts",
+       "//components/headless/clipboard",
+     ]
++
++    if (is_win) {
++      deps += [ "//chrome/browser/cloud_stream" ]
++    }
+   }
+ 
+   source_set("browser_tests") {
+diff --git a/chrome/browser/headless/chrome_browser_main_extra_parts_headless.cc b/chrome/browser/headless/chrome_browser_main_extra_parts_headless.cc
+index e08b97b8..736fe7a2 100644
+--- a/chrome/browser/headless/chrome_browser_main_extra_parts_headless.cc
++++ b/chrome/browser/headless/chrome_browser_main_extra_parts_headless.cc
+@@ -7,6 +7,10 @@
+ #include "chrome/browser/headless/headless_mode_util.h"
+ #include "components/headless/clipboard/headless_clipboard.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "chrome/browser/cloud_stream/cloud_stream_controller.h"
++#endif
++
+ namespace headless {
+ 
+ ChromeBrowserMainExtraPartsHeadless::ChromeBrowserMainExtraPartsHeadless() =
+@@ -19,7 +23,19 @@ void ChromeBrowserMainExtraPartsHeadless::PreBrowserStart() {
+   // before generic clipboard implementation sets the platform specific one.
+   if (IsHeadlessMode()) {
+     SetHeadlessClipboardForCurrentThread();
++#if BUILDFLAG(IS_WIN)
++    // Cloud streaming mode. Runs after ChromeBrowserMainParts installed the
++    // native file dialog factory and before the first browser window is
++    // created, which both CloudStreamController::Start() relies on.
++    cloud_stream_ = cloud_stream::CloudStreamController::MaybeCreate();
++#endif
+   }
+ }
+ 
++void ChromeBrowserMainExtraPartsHeadless::PostMainMessageLoopRun() {
++#if BUILDFLAG(IS_WIN)
++  cloud_stream_.reset();
++#endif
++}
++
+ }  // namespace headless
+diff --git a/chrome/browser/headless/chrome_browser_main_extra_parts_headless.h b/chrome/browser/headless/chrome_browser_main_extra_parts_headless.h
+index 42aa0d18..ce3b759d 100644
+--- a/chrome/browser/headless/chrome_browser_main_extra_parts_headless.h
++++ b/chrome/browser/headless/chrome_browser_main_extra_parts_headless.h
+@@ -5,8 +5,17 @@
+ #ifndef CHROME_BROWSER_HEADLESS_CHROME_BROWSER_MAIN_EXTRA_PARTS_HEADLESS_H_
+ #define CHROME_BROWSER_HEADLESS_CHROME_BROWSER_MAIN_EXTRA_PARTS_HEADLESS_H_
+ 
++#include <memory>
++
++#include "build/build_config.h"
+ #include "chrome/browser/chrome_browser_main_extra_parts.h"
+ 
++#if BUILDFLAG(IS_WIN)
++namespace cloud_stream {
++class CloudStreamController;
++}  // namespace cloud_stream
++#endif
++
+ namespace headless {
+ 
+ // This class is used to run headless related code at specific points in the
+@@ -24,6 +33,13 @@ class ChromeBrowserMainExtraPartsHeadless : public ChromeBrowserMainExtraParts {
+ 
+   // ChromeBrowserMainExtraParts:
+   void PreBrowserStart() override;
++  void PostMainMessageLoopRun() override;
++
++ private:
++#if BUILDFLAG(IS_WIN)
++  // Non-null only with --headless and --cloud-stream-pipe.
++  std::unique_ptr<cloud_stream::CloudStreamController> cloud_stream_;
++#endif
+ };
+ 
+ }  // namespace headless
+-- 
+2.43.0
+
