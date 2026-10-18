@@ -138,6 +138,39 @@ tab capture / FrameSinkVideoCapturer
 
 还需要处理的反向通道：光标形状（`RenderWidgetHostViewBase::UpdateCursor`）、剪贴板（替换 `ui::Clipboard` 实现，按租户隔离）、IME 候选框位置（`TextInputManager`）、文件上传/下载、音频（`AudioOutputStream` → WebRTC audio，可以替换音频输出设备实现，headless 下可以完全不碰系统声卡）。
 
+### 1.3 不编译 Chromium：OBS 式 DXGI Present hook（DLL 注入拿纹理）
+
+思路和 OBS game capture 一样：往 Chromium 的 **GPU 进程**注入 DLL，hook `IDXGISwapChain::Present/Present1` 的 COM vtable，在 Present 时把 backbuffer `CopyResource` 进一张共享纹理（NT handle + keyed mutex / fence），交给编码进程。hook 的是 DXGI 公开 ABI，**不依赖 Chromium 内部符号，跨版本稳定**。
+
+**能 hook 到什么（源码核对）**：
+- `--headless=new` 默认走 `SkiaOutputDeviceDComp` → `DCompPresenter`，GPU 进程里有 flip-model swap chain，绑在 GPU 进程自己的 `ChildWindowWin` 上。
+- DComp 不可用时走 `SkiaOutputDeviceDawnSwapChain`（Dawn 的 `wgpu::Surface`）。源码注释写明"flip model swap chains can't bind to a foreign-process HWND"，所以 **swap chain 一定在 GPU 进程里**，注入目标是 GPU 进程，不是 browser 进程。
+
+**难点**：
+
+| # | 问题 | 依据 / 对策 |
+|---|---|---|
+| 1 | **GPU 进程沙箱拒绝加载第三方 DLL**（致命） | `sandbox_win.cc`：所有沙箱进程都开了 `MITIGATION_FORCE_MS_SIGNED_BINS`（只允许加载微软签名的 DLL）、`MITIGATION_EXTENSION_POINT_DISABLE`、`MITIGATION_IMAGE_LOAD_NO_REMOTE`；`kGpu` 额外加 lockdown DACL 和 random SID。必须用 `--disable-gpu-sandbox`（或 `--no-sandbox`）+ `--allow-third-party-modules` 启动。renderer 沙箱可以保留，但 GPU 进程失去沙箱后，租户隔离只能靠外层的账户/容器/VM。 |
+| 2 | **视频等 overlay 不在根 swap chain 里** | DComp 会把 `<video>` 等提升为独立的 overlay swap chain，hook 根 swap chain 会漏掉。用 `--disable_direct_composition_video_overlays=1`（workaround 同名开关）或 `--disable-direct-composition` 压回单一 swap chain。**backbuffer 里实际有什么，需 PoC 实测。** |
+| 3 | GPU 进程会重建 | context lost / GPU 崩溃后 browser 会重启 GPU 进程，hook 跟着丢失。需要监听子进程创建并重新注入；也可以用 `--in-process-gpu` 把 GPU 放进 browser 进程，只注入一次（这是测试用开关，稳定性需验证）。 |
+| 4 | 只解决输出 | 输入仍走 CDP `Input.*`（无需注入）。光标形状、剪贴板这类反向通道 CDP 覆盖不全。 |
+| 5 | present 节奏 | 页面内容不变时不 Present，编码端要能重复上一帧；隐藏或 cloak 窗口上的 flip-model Present 会不会被节流（`DXGI_STATUS_OCCLUDED`），需 PoC 验证。 |
+
+**与 CEF 对比**：OBS 自己显示网页（`obs-browser`）用的是 CEF 的 `OnAcceleratedPaint` 共享纹理，而不是对 Chrome 做 present hook。CEF 预编译库（Spotify CDN）直接提供 D3D11 共享纹理和进程内输入（`SendMouseClickEvent/SendKeyEvent`），GPU 沙箱不用关，overlay 也不是问题（它走 capturer）；代价是 popup 要自己叠加，且版本兼容问题要回归测试。
+
+| | Present hook（官方 chrome.exe） | CEF 预编译库 |
+|---|---|---|
+| 编译 Chromium | 否 | 否（只编译自己的宿主） |
+| 零拷贝纹理 | 是（多一次 GPU `CopyResource`，约 0.1 ms） | 是 |
+| GPU 沙箱 | **必须关** | 保留 |
+| 视频 overlay | 要关掉 | 无影响 |
+| popup（`<select>`） | 包含（整窗合成） | 需自己叠加 |
+| 输入 | CDP | 进程内 API |
+| 完整 Chrome 功能（扩展等） | 有 | 部分 |
+| 维护 | 低（DXGI ABI 稳定），但要处理重注入 | 跟随 CEF 版本 |
+
+结论：**两条都不用编译 Chromium**。如果能接受换成 CEF，优先用 CEF。如果必须用官方 Chrome（比如需要扩展、完整 Chrome 行为），present hook 可行且不难写，hook 本身只有几百行（MinHook/Detours），前提是接受关闭 GPU 沙箱，并把租户隔离交给外层。注意 OBS 的 `graphics-hook` 是 GPLv2，闭源产品不要直接复用，可以参考思路自己实现。
+
 ---
 
 ## 2. Windows 原生方案的多租户与 GPU
