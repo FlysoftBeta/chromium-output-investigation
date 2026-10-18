@@ -155,8 +155,28 @@ tab capture / FrameSinkVideoCapturer
 | 3 | GPU 进程会重建 | context lost / GPU 崩溃后 browser 会重启 GPU 进程，hook 跟着丢失。需要监听子进程创建并重新注入；也可以用 `--in-process-gpu` 把 GPU 放进 browser 进程，只注入一次（这是测试用开关，稳定性需验证）。 |
 | 4 | 只解决输出 | 输入仍走 CDP `Input.*`（无需注入）。光标形状、剪贴板这类反向通道 CDP 覆盖不全。 |
 | 5 | present 节奏 | 页面内容不变时不 Present，编码端要能重复上一帧；隐藏或 cloak 窗口上的 flip-model Present 会不会被节流（`DXGI_STATUS_OCCLUDED`），需 PoC 验证。 |
-| 6 | **抓到的是整个窗口，含 Chrome UI** | new headless 是完整 Chrome，窗口里有标签栏/工具栏；权限气泡、菜单等是独立 widget（独立 HWND → 独立 DComp presenter / swap chain）。用 `--kiosk` 或 `--start-fullscreen` 去掉浏览器 UI（`HWNDMessageHandlerHeadless` 支持 fullscreen 状态）；hook 会看到多个 swap chain，要按尺寸或创建顺序区分主窗口。`<select>` 下拉是否单独成 swap chain 需 PoC。 |
+| 6 | **一个窗口不等于一张纹理** | 主窗口的 swap chain 里有标签栏、工具栏和页面；菜单、权限气泡等是独立的顶层 widget（独立 HWND → 独立 DComp presenter / swap chain），要按各自窗口位置自己合成。**系统原生对话框（文件选择、另存为、Windows Hello / WebAuthn 系统 UI 等）不经过 Chrome 的 swap chain，hook 抓不到。** 见 §1.4。 |
 | 7 | **一个 Chrome 实例共用一个 GPU 进程** | 多租户按"每租户一个 Chrome 实例（独立 `--user-data-dir`）"，每个实例一个 GPU 进程、一个 hook。 |
+
+### 1.4 目标是"完整浏览器体验"时的重新评估
+
+"完整体验"指浏览器 UI（标签栏、地址栏、菜单、扩展弹窗、权限气泡）和系统原生对话框都要能看到、能操作。在这个前提下，前面几种方案要重新排序：
+
+**headless 不是合适的底座**（源码核对）：
+- CDP `Input.*` 只能把事件送进**页面**（RenderWidgetHost），点不到标签栏、地址栏、菜单这些 views UI。
+- new headless 会装上进程内的 headless 剪贴板（`chrome_browser_main_extra_parts_headless` 依赖 `//components/headless/clipboard`），行为和普通 Chrome 不同。
+- 窗口的可见性、焦点都是"伪造"的（`HWNDMessageHandlerHeadless`），依赖窗口状态的 UI 行为可能和有头 Chrome 不一致。
+- 结论：完整体验应该用**有头（headful）Chrome**。
+
+**Windows 的根本约束：一个会话只有一个输入焦点。** `SendInput` 作用于整个会话的输入桌面，键盘焦点也是每会话一个。所以在 Windows 上，**"每租户一个完整浏览器"基本等于"每租户一个交互式会话/桌面"**，无论画面怎么抓。
+
+| 方案 | 画面 | 输入 | 原生对话框 | 隔离 | 评价 |
+|---|---|---|---|---|---|
+| **W1. 每租户一个 Windows VM**（Hyper-V GPU-P / GPU-PV）+ 有头 Chrome + 虚拟显示器（IddCx）+ DDA/WGC 抓整屏 | 整个桌面，一切可见 | `SendInput`（VM 内只有一个用户） | ✅ | VM 级 | **Windows 上最完整、最稳妥**，就是 Parsec / Sunshine 的模式；抓屏多约 1 个合成帧，云浏览器可以接受。缺点是 VM 开销大，密度低。 |
+| **L1. Linux 容器**（每租户一个容器：有头 Chrome + 独立的 headless Wayland/X 显示服务）| 显示服务端抓整屏（dmabuf，零拷贝） | 显示服务端的虚拟输入设备 | ✅（Linux 下文件选择框等也由 Chrome/显示服务端绘制） | 容器级 | 每个容器有自己的显示服务和输入焦点，天然解决"一会话一焦点"的问题；业界云浏览器的主流做法。前提是 Linux 宿主（或 Linux VM）+ 原生 GPU 驱动，不能是 WSL。 |
+| W2. 共享桌面 + 多个 headless Chrome + 纹理 hook（§1.3）| 只有 Chrome 自己画的部分 | 页面靠 CDP，浏览器 UI 难以操作 | ❌ | 弱 | 密度最高，但达不到"完整体验"，只适合"只要网页内容"的场景。 |
+
+**建议**：要完整体验，Windows 上选 W1（每租户一个 VM，整桌面抓取），能接受 Linux 就选 L1。§1.3 的纹理 hook 只在"只要网页内容、追求密度"时才值得。
 
 ---
 
