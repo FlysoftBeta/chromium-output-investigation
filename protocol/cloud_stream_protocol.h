@@ -71,7 +71,8 @@ enum class MouseAction : uint32_t {
   kLeave = 4,
 };
 
-// Bit values match ui::EventFlags so Chrome can pass them through.
+// Keyboard modifier bit values match ui::EventFlags. Button bits are
+// protocol-specific; Chrome maps them to ui::EF_*_MOUSE_BUTTON.
 enum Modifier : uint32_t {
   kShift = 1 << 1,
   kControl = 1 << 2,

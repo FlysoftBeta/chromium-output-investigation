@@ -1,7 +1,7 @@
 From 5de0795cd25fa906ddb1c8fc0e1c3fc92d0bda28 Mon Sep 17 00:00:00 2001
 From: FlysoftBeta <xwnunjyau@outlook.com>
 Date: Sun, 18 Oct 2026 03:15:16 +0000
-Subject: [PATCH 2/3] [cloud_stream] Add CloudStreamHooksWin to
+Subject: [PATCH 2/4] [cloud_stream] Add CloudStreamHooksWin to
  DesktopWindowTreeHostWin
 
 Lets the embedder enable external BeginFrame control, observe cursor

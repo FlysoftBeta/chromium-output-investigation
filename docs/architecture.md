@@ -160,7 +160,7 @@
 
 全部改动只在 `--cloud-stream-pipe` 存在时生效，不影响普通 Chrome 行为。
 
-**已实现的补丁见 [`patches/`](../patches) 和 [interface.md](interface.md)**：P1、P2、P3（除远程输入、剪贴板外）、P4、P5（先禁用拖放）、P7 已写；P6、P8 和远程输入尚未实现。
+**已实现的补丁见 [`patches/`](../patches) 和 [interface.md](interface.md)**：P1、P2、P3（含远程输入，不含剪贴板）、P4、P5（先禁用拖放）、P7 已写；P6、P8、剪贴板桥接尚未实现。
 
 | ID | 位置（M158） | 改动 | 估计规模 | 阶段 |
 |---|---|---|---|---|

@@ -50,7 +50,7 @@ views 不能依赖 chrome，所以由 chrome 实现这个接口、再用 `Set()`
 | `WindowStream` | 每个窗口一个。对 `compositor->frame_sink_id()` 建 `FrameSinkVideoCapturer`（ARGB + `kPreferSharedImageWithNativeHandle`），把 DXGI NT handle `DuplicateHandle` 到网关进程后发 `kFrame`；收到 `kFrameDone` 才归还缓冲 |
 | `PipeTransport` | 命名管道。读在专用线程，消息投递回 UI 线程；写加锁，任意线程可调用 |
 | `CloudSelectFileDialog(Factory)` | 替换所有文件对话框，转成 `kFileChooserRequest` |
-| `RemoteInput` | **只有声明，未实现**（见 §4） |
+| `RemoteInput` | 把 `kMouse/kWheel/kKey/kText/kComposition` 转成 `ui::Event`，对目标 host 调 `SendEventToSink()`（与 `DesktopWindowTreeHostWin::HandleMouseEvent` 同一入口）。鼠标按键位在协议里与 `ui::EventFlags` 不同，内部做映射；文字和组字走 `TextInputClient` |
 
 ## 3. 网关一侧要实现的协议
 
@@ -98,7 +98,7 @@ views 不能依赖 chrome，所以由 chrome 实现这个接口、再用 `Set()`
 
 | 项 | 位置 | 做法 |
 |---|---|---|
-| 远程输入 | `remote_input.h` 已声明，缺 `remote_input.cc`；`CloudStreamController::OnMessage` 里对应分支是 TODO | architecture.md §3.6：鼠标和滚轮构造 `ui::MouseEvent` / `ui::MouseWheelEvent`，调用 `host->SendEventToSink()`；按键发 keydown/keyup；文字用 `ui::KeyEvent::FromCharacter()`（会转成 `WM_CHAR` 走 `OnChar`）或 `TextInputClient::InsertText()`；输入法组字用 `SetCompositionText()` |
+| ~~远程输入~~ | 已实现：`remote_input.cc`，`OnMessage` 按 `window_id` 查 host，未知窗口直接忽略 | 键盘只发非文字键（`DispatchKey`），可打印字符与输入法结果走 `kText` / `kComposition` |
 | 剪贴板桥接 | `OnMessage` 的 `kClipboardText` 分支 | 读写 headless 剪贴板（`components/headless/clipboard`），变化时发 `kClipboardChanged` |
 | 拖放 | `NoopDragDropClient` | 实现由远程指针驱动的进程内拖放 |
 | 软件合成降级 | `WindowStream::OnFrameCaptured` 丢弃非 GPU 帧 | 转发共享内存帧 |
@@ -114,3 +114,9 @@ views 不能依赖 chrome，所以由 chrome 实现这个接口、再用 `Set()`
 - `CloudStreamController::HandleFileChosen` 里 `std::u16string` → `base::FilePath` 的转换。
 - `WindowStream` 里 `dxgi.token().value()` 的类型（`base::TokenType` 的 `value()` 返回 `base::Token`）。
 - `NoopDragDropClient` 是否还需要实现 Windows 下其他纯虚函数。
+- `RemoteInput`（未编译）：
+  - 协议头原先写“Modifier 位等于 `ui::EventFlags`”，只对 Shift/Ctrl/Alt/Command 成立；`EF_LEFT/MIDDLE/RIGHT_MOUSE_BUTTON` 是 1<<11/12/13，而协议的按键位是 1<<6/7/8（1<<6 在 `ui::EventFlags` 里是 `EF_ALTGR_DOWN`）。已在 `remote_input.cc` 里显式映射，并改了协议头注释，线上数值没变。
+  - 滚轮：直接把 `delta_x/delta_y`（120 倍数）当 `MouseWheelEvent` 的 offset，并未核对水平方向的正负号是否与 `WM_MOUSEHWHEEL` 路径一致；`tick_120ths` 没传。
+  - 按键：`DomKey` 不设置，依赖 `KeyEvent::ApplyLayout()` 惰性推导；Windows 下是否得到正确的 `key` 值未验证。扫描码用 `ui::CodeForWindowsScanCode()`（`keyboard_code_conversion_win.h`）转 `DomCode`；0xE0xx 的扩展键额外置 `EF_IS_EXTENDED_KEY`。
+  - 文字 / 组字：没有 `TextInputClient`（焦点不在可输入控件）时静默丢弃。`InsertText` 在存在组字时是否会先替换组字文本取决于具体 client（Textfield / RenderWidgetHostViewAura），网关应在提交前先发一条 `length == 0` 的 `kComposition`。
+  - GN deps 新增 `//ui/base/ime`、`//ui/events:dom_keycode_converter`、`//ui/events:events_base`，target 名已对照 BUILD.gn，但未编译。

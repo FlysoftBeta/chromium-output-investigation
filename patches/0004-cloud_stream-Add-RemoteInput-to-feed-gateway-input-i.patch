@@ -1,0 +1,365 @@
+From 0a923c280e865505af23d1172f00d4f52a5be8d8 Mon Sep 17 00:00:00 2001
+From: FlysoftBeta <xwnunjyau@outlook.com>
+Date: Sun, 18 Oct 2026 03:19:08 +0000
+Subject: [PATCH 4/4] [cloud_stream] Add RemoteInput to feed gateway input into
+ aura hosts
+
+Convert kMouse/kWheel/kKey/kText/kComposition messages into ui::Events and
+send them to the target WindowTreeHost through SendEventToSink(), like
+DesktopWindowTreeHostWin does for native messages. Text and IME results go
+through the host's TextInputClient because a synthesized key down never
+yields WM_CHAR.
+
+Mouse button bits are not equal to ui::EventFlags, so map them explicitly
+and fix the protocol header comment.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qc5pKk7gGDBmCDRh2reKqv
+---
+ chrome/browser/cloud_stream/BUILD.gn          |   8 +-
+ .../cloud_stream/cloud_stream_controller.cc   |  58 ++++--
+ .../public/cloud_stream_protocol.h            |   3 +-
+ chrome/browser/cloud_stream/remote_input.cc   | 189 ++++++++++++++++++
+ 4 files changed, 240 insertions(+), 18 deletions(-)
+ create mode 100644 chrome/browser/cloud_stream/remote_input.cc
+
+diff --git a/chrome/browser/cloud_stream/BUILD.gn b/chrome/browser/cloud_stream/BUILD.gn
+index a48635a0..28b16138 100644
+--- a/chrome/browser/cloud_stream/BUILD.gn
++++ b/chrome/browser/cloud_stream/BUILD.gn
+@@ -16,11 +16,10 @@ source_set("cloud_stream") {
+     "cloud_stream_controller.h",
+     "pipe_transport.cc",
+     "pipe_transport.h",
++    "remote_input.cc",
++    "remote_input.h",
+     "window_stream.cc",
+     "window_stream.h",
+-
+-    # TODO(cloud_stream): add remote_input.cc once implemented.
+-    "remote_input.h",
+   ]
+ 
+   public_deps = [ ":protocol" ]
+@@ -38,8 +37,11 @@ source_set("cloud_stream") {
+     "//ui/base/cursor",
+     "//ui/base/cursor/mojom:cursor_type",
+     "//ui/base/dragdrop/mojom",
++    "//ui/base/ime",
+     "//ui/compositor",
+     "//ui/events",
++    "//ui/events:dom_keycode_converter",
++    "//ui/events:events_base",
+     "//ui/gfx",
+     "//ui/shell_dialogs",
+     "//ui/views",
+diff --git a/chrome/browser/cloud_stream/cloud_stream_controller.cc b/chrome/browser/cloud_stream/cloud_stream_controller.cc
+index c471bd2e..003713ed 100644
+--- a/chrome/browser/cloud_stream/cloud_stream_controller.cc
++++ b/chrome/browser/cloud_stream/cloud_stream_controller.cc
+@@ -17,6 +17,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/cloud_stream/cloud_select_file_dialog.h"
+ #include "chrome/browser/cloud_stream/pipe_transport.h"
++#include "chrome/browser/cloud_stream/remote_input.h"
+ #include "chrome/browser/cloud_stream/window_stream.h"
+ #include "components/viz/common/frame_sinks/begin_frame_args.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+@@ -80,8 +81,8 @@ class NoopDragDropClient : public aura::client::DragDropClient {
+   void DragCancel() override {}
+   bool IsDragDropInProgress() override { return false; }
+   void AddObserver(aura::client::DragDropClientObserver* observer) override {}
+-  void RemoveObserver(
+-      aura::client::DragDropClientObserver* observer) override {}
++  void RemoveObserver(aura::client::DragDropClientObserver* observer) override {
++  }
+ };
+ 
+ // Framed windows (browser, app, DevTools) are kNormal; everything else
+@@ -200,9 +201,9 @@ void CloudStreamController::StartStream(uint32_t id,
+   if (!host->compositor()) {
+     return;
+   }
+-  streams_[id] = std::make_unique<WindowStream>(
+-      id, host, transport_.get(), gateway_process_.get(),
+-      kDefaultCapturePeriod);
++  streams_[id] = std::make_unique<WindowStream>(id, host, transport_.get(),
++                                                gateway_process_.get(),
++                                                kDefaultCapturePeriod);
+ }
+ 
+ aura::WindowTreeHost* CloudStreamController::HostForId(uint32_t id) const {
+@@ -293,14 +294,44 @@ void CloudStreamController::OnMessage(MessageType type,
+       }
+       break;
+     }
+-    case MessageType::kMouse:
+-    case MessageType::kWheel:
+-    case MessageType::kKey:
+-    case MessageType::kText:
+-    case MessageType::kComposition:
+-      // TODO(cloud_stream): remote input, see remote_input.h and
+-      // docs/architecture.md section 3.6. Not implemented in this patch.
++    case MessageType::kMouse: {
++      MouseMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        RemoteInput::DispatchMouse(HostForId(msg.window_id), msg);
++      }
++      break;
++    }
++    case MessageType::kWheel: {
++      WheelMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        RemoteInput::DispatchWheel(HostForId(msg.window_id), msg);
++      }
++      break;
++    }
++    case MessageType::kKey: {
++      KeyMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        RemoteInput::DispatchKey(HostForId(msg.window_id), msg);
++      }
++      break;
++    }
++    case MessageType::kText: {
++      TextMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        RemoteInput::CommitText(HostForId(msg.window_id),
++                                ReadTail<TextMessage>(payload, msg.length));
++      }
++      break;
++    }
++    case MessageType::kComposition: {
++      CompositionMessage msg;
++      if (ReadStruct(payload, &msg)) {
++        RemoteInput::SetComposition(
++            HostForId(msg.window_id),
++            ReadTail<CompositionMessage>(payload, msg.length), msg.cursor);
++      }
+       break;
++    }
+     case MessageType::kClipboardText:
+       // TODO(cloud_stream): bridge to the headless clipboard.
+       break;
+@@ -376,8 +407,7 @@ void CloudStreamController::HandleFrameDone(const FrameDoneMessage& msg) {
+ void CloudStreamController::HandleSetWindowBounds(
+     const WindowBoundsMessage& msg) {
+   if (aura::WindowTreeHost* host = HostForId(msg.window_id)) {
+-    host->SetBoundsInPixels(
+-        gfx::Rect(msg.x, msg.y, msg.width, msg.height));
++    host->SetBoundsInPixels(gfx::Rect(msg.x, msg.y, msg.width, msg.height));
+   }
+ }
+ 
+diff --git a/chrome/browser/cloud_stream/public/cloud_stream_protocol.h b/chrome/browser/cloud_stream/public/cloud_stream_protocol.h
+index f4b441db..b9166789 100644
+--- a/chrome/browser/cloud_stream/public/cloud_stream_protocol.h
++++ b/chrome/browser/cloud_stream/public/cloud_stream_protocol.h
+@@ -71,7 +71,8 @@ enum class MouseAction : uint32_t {
+   kLeave = 4,
+ };
+ 
+-// Bit values match ui::EventFlags so Chrome can pass them through.
++// Keyboard modifier bit values match ui::EventFlags. Button bits are
++// protocol-specific; Chrome maps them to ui::EF_*_MOUSE_BUTTON.
+ enum Modifier : uint32_t {
+   kShift = 1 << 1,
+   kControl = 1 << 2,
+diff --git a/chrome/browser/cloud_stream/remote_input.cc b/chrome/browser/cloud_stream/remote_input.cc
+new file mode 100644
+index 00000000..80afe068
+--- /dev/null
++++ b/chrome/browser/cloud_stream/remote_input.cc
+@@ -0,0 +1,189 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/cloud_stream/remote_input.h"
++
++#include <windows.h>
++
++#include <algorithm>
++
++#include "base/time/time.h"
++#include "ui/aura/window_tree_host.h"
++#include "ui/base/ime/composition_text.h"
++#include "ui/base/ime/input_method.h"
++#include "ui/base/ime/text_input_client.h"
++#include "ui/events/event.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/dom/dom_code.h"
++#include "ui/events/keycodes/keyboard_code_conversion_win.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/geometry/vector2d.h"
++#include "ui/gfx/range/range.h"
++
++namespace cloud_stream {
++
++namespace {
++
++// Keyboard modifiers share their bit values with ui::EventFlags, mouse
++// buttons do not (EF_LEFT_MOUSE_BUTTON is 1 << 11, not 1 << 6).
++constexpr uint32_t kKeyboardModifierMask = kShift | kControl | kAlt | kCommand;
++
++int ToEventFlags(uint32_t modifiers) {
++  int flags = static_cast<int>(modifiers & kKeyboardModifierMask);
++  if (modifiers & kLeftButton) {
++    flags |= ui::EF_LEFT_MOUSE_BUTTON;
++  }
++  if (modifiers & kMiddleButton) {
++    flags |= ui::EF_MIDDLE_MOUSE_BUTTON;
++  }
++  if (modifiers & kRightButton) {
++    flags |= ui::EF_RIGHT_MOUSE_BUTTON;
++  }
++  return flags;
++}
++
++int ToChangedButtonFlags(uint32_t changed_button) {
++  switch (changed_button) {
++    case kLeftButton:
++      return ui::EF_LEFT_MOUSE_BUTTON;
++    case kMiddleButton:
++      return ui::EF_MIDDLE_MOUSE_BUTTON;
++    case kRightButton:
++      return ui::EF_RIGHT_MOUSE_BUTTON;
++    default:
++      return ui::EF_NONE;
++  }
++}
++
++constexpr int kAnyButtonFlags = ui::EF_LEFT_MOUSE_BUTTON |
++                                ui::EF_MIDDLE_MOUSE_BUTTON |
++                                ui::EF_RIGHT_MOUSE_BUTTON;
++
++}  // namespace
++
++// static
++void RemoteInput::DispatchMouse(aura::WindowTreeHost* host,
++                                const MouseMessage& msg) {
++  if (!host) {
++    return;
++  }
++  const int flags = ToEventFlags(msg.modifiers);
++  const int changed_button_flags = ToChangedButtonFlags(msg.changed_button);
++  ui::EventType type;
++  switch (msg.action) {
++    case MouseAction::kMove:
++      type = (flags & kAnyButtonFlags) ? ui::EventType::kMouseDragged
++                                       : ui::EventType::kMouseMoved;
++      break;
++    case MouseAction::kDown:
++      type = ui::EventType::kMousePressed;
++      break;
++    case MouseAction::kUp:
++      type = ui::EventType::kMouseReleased;
++      break;
++    case MouseAction::kEnter:
++      type = ui::EventType::kMouseEntered;
++      break;
++    case MouseAction::kLeave:
++      type = ui::EventType::kMouseExited;
++      break;
++    default:
++      return;
++  }
++  // Protocol coordinates are window pixels, which are host pixels for a
++  // top-level host, so location and root_location are the same.
++  const gfx::PointF location(msg.x, msg.y);
++  ui::MouseEvent event(type, location, location, base::TimeTicks::Now(), flags,
++                       changed_button_flags);
++  if (type == ui::EventType::kMousePressed) {
++    event.SetClickCount(
++        static_cast<int>(std::max<uint32_t>(msg.click_count, 1)));
++  }
++  // Same entry point as DesktopWindowTreeHostWin::HandleMouseEvent().
++  host->SendEventToSink(&event);
++}
++
++// static
++void RemoteInput::DispatchWheel(aura::WindowTreeHost* host,
++                                const WheelMessage& msg) {
++  if (!host) {
++    return;
++  }
++  const gfx::PointF location(msg.x, msg.y);
++  // The deltas are in WM_MOUSEWHEEL units (120 per notch), which is what
++  // ui::MouseWheelEvent offsets hold for events created from native
++  // Windows messages.
++  ui::MouseWheelEvent event(gfx::Vector2d(msg.delta_x, msg.delta_y), location,
++                            location, base::TimeTicks::Now(),
++                            ToEventFlags(msg.modifiers), ui::EF_NONE);
++  host->SendEventToSink(&event);
++}
++
++// static
++void RemoteInput::DispatchKey(aura::WindowTreeHost* host,
++                              const KeyMessage& msg) {
++  if (!host) {
++    return;
++  }
++  int flags = ToEventFlags(msg.modifiers);
++  if ((msg.scan_code & 0xFF00) == 0xE000) {
++    flags |= ui::EF_IS_EXTENDED_KEY;
++  }
++  const ui::KeyboardCode key_code =
++      ui::KeyboardCodeForWindowsKeyCode(static_cast<WORD>(msg.windows_vk));
++  const ui::DomCode dom_code =
++      ui::CodeForWindowsScanCode(static_cast<WORD>(msg.scan_code));
++  // The DomKey is left unset and derived lazily from the DomCode.
++  ui::KeyEvent event(
++      msg.pressed ? ui::EventType::kKeyPressed : ui::EventType::kKeyReleased,
++      key_code, dom_code, flags, base::TimeTicks::Now());
++  host->SendEventToSink(&event);
++}
++
++// static
++void RemoteInput::CommitText(aura::WindowTreeHost* host,
++                             const std::u16string& text) {
++  if (!host || text.empty()) {
++    return;
++  }
++  ui::InputMethod* input_method = host->GetInputMethod();
++  if (!input_method) {
++    return;
++  }
++  if (ui::TextInputClient* client = input_method->GetTextInputClient()) {
++    client->InsertText(
++        text,
++        ui::TextInputClient::InsertTextCursorBehavior::kMoveCursorAfterText);
++  }
++}
++
++// static
++void RemoteInput::SetComposition(aura::WindowTreeHost* host,
++                                 const std::u16string& text,
++                                 uint32_t cursor) {
++  if (!host) {
++    return;
++  }
++  ui::InputMethod* input_method = host->GetInputMethod();
++  if (!input_method) {
++    return;
++  }
++  ui::TextInputClient* client = input_method->GetTextInputClient();
++  if (!client) {
++    return;
++  }
++  if (text.empty()) {
++    client->ClearCompositionText();
++    return;
++  }
++  ui::CompositionText composition;
++  composition.text = text;
++  const size_t caret = std::min<size_t>(cursor, text.size());
++  composition.selection =
++      gfx::Range(static_cast<uint32_t>(caret), static_cast<uint32_t>(caret));
++  client->SetCompositionText(composition);
++}
++
++}  // namespace cloud_stream
+-- 
+2.43.0
+
