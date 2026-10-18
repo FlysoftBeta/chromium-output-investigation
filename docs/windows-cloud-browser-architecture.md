@@ -55,6 +55,51 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 - `ui/views/win/hwnd_message_handler_headless.h`：**`chrome --headless`（new headless）在 Windows 上用 `HWNDMessageHandlerHeadless`，"platform windows exist but are never shown"**，即仍然有真实 HWND → 有 surface handle → **走 DComp 路径**，不是 Offscreen。所以生产方案应基于 `//headless`（headless_shell）或自己的 content embedder，而不是 `chrome --headless`。
 - **渲染后端（M158 已核对）**：`gpu/config/gpu_finch_features.cc` 中 `kSkiaGraphite` 在 Windows/Apple 上 **默认开启**；`DawnContextProvider::GetDefaultBackendType()` 在 Windows 上默认 **D3D11**（`--skia-graphite-dawn-backend=d3d12` 可切 D3D12）。Ganesh/ANGLE 只是回退路径。所以新增的输出设备必须**基于 SharedImage 抽象**，同时兼容 Graphite/Dawn，不要写死 ANGLE EGL。好消息是默认后端仍然是 D3D11，D3D11 共享纹理/keyed mutex/shared fence 的方案依然成立。
 
+### 1.0 `chrome --headless`（new headless）在 Windows 上的实际路径（源码核对）
+
+```
+chrome.exe --headless
+  │ chrome/browser/headless/headless_mode_init.cc
+  │   只追加 --incognito / --no-first-run / --no-error-dialogs / 临时 user-data-dir
+  │   （Linux 额外加 --ozone-platform=headless，并默认 --use-angle=swiftshader-webgl；
+  │    Windows 不改任何 GPU 开关 → 默认硬件 GPU）
+  ▼
+完整的 Chrome 浏览器（Browser / BrowserView / 扩展 / views UI 都在）
+  │ DesktopWindowTreeHostWin
+  │ HWNDMessageHandler 工厂按 display::Screen::IsHeadless() 选择 HWNDMessageHandlerHeadless
+  ▼
+真实的顶层 HWND：WindowImpl::Init() 创建，但
+  - 从不 ShowWindow，Show()/Hide() 只维护 is_visible_ 并回调 HandleVisibilityChanged
+  - DwmSetWindowAttribute(DWMWA_CLOAK, TRUE)：告诉 DWM 永远不显示
+  - aura::WindowTreeHost 在 --headless 下关闭 native occlusion 计算（不会因"不可见"而停绘）
+  ▼
+ui::Compositor 的 AcceleratedWidget = 这个 HWND（非空 surface handle）
+  ▼
+GPU 进程 viz：Graphite/Dawn D3D11 → SkiaOutputDeviceDComp → DCompPresenter
+  - DCompPresenter 在 GPU 进程里创建 ChildWindowWin，经 AddChildWindowToBrowser 挂到被 cloak 的 HWND 下
+  - DCLayerTree 正常建 swap chain / DComp surface，视频照常可以走 overlay
+  - 每帧照常 Present/Commit，但 DWM 不合成这个窗口 → 这部分 GPU 工作是白做的
+  ▼
+取帧只能通过 viz 的 CopyOutputRequest：CDP Page.captureScreenshot / Page.startScreencast、
+tab capture / FrameSinkVideoCapturer
+```
+
+对云浏览器的影响：
+
+| 方面 | new headless（`chrome --headless`） | headless_shell（`//headless`） |
+|---|---|---|
+| 输出设备 | `SkiaOutputDeviceDComp`（往看不见的窗口 present） | `SkiaOutputDeviceOffscreen` |
+| GPU | 默认硬件 | 需显式开启（默认软件/SwiftShader 路径，以版本为准） |
+| 浏览器功能 | 完整 Chrome（扩展、策略、Chrome 的 permission/下载逻辑） | 精简的 content embedder，很多 UI 需自己实现 |
+| 外部 BeginFrame（`--enable-begin-frame-control` / `HeadlessExperimental.beginFrame`） | **没有**（只在 `headless/lib` 里实现，`chrome/browser/headless` 中找不到） | 有 |
+| 不改代码取帧 | 可以：`FrameSinkVideoCapturer`（tab capture / CDP screencast） | 可以 |
+| WGC | **基本不可用**：窗口被 cloak 且不可见，DWM 不合成（预期，需验证） | 无窗口，不可用 |
+| `SendInput` | 不可用（窗口不在前台、不可见） | 无窗口 |
+| 输入 | CDP `Input.*` 或进程内 `RenderWidgetHost::Forward*Event` | 同左 |
+| 做 L4 hack | 要么改 `SkiaOutputDeviceDComp`/`DCompPresenter`，要么打补丁让 headless 模式下 surface handle 为空、退回 Offscreen | 直接改 Offscreen 或 BufferQueue+Presenter |
+
+结论：new headless 适合"**不改 Chromium + 用 FrameSinkVideoCapturer 取帧 + CDP 注入输入**"的方案，好处是完整 Chrome 功能（扩展等）；代价是每帧多一次没用的 DComp present，而且没有外部 BeginFrame 来控制出帧节奏。要做 L4 零拷贝 + 按需出帧，headless_shell 是阻力更小的底座；如果又想要完整 Chrome 功能，就在 new headless 上打一个"headless 时用空 surface handle"的补丁。
+
 ### 1.1 各 hack 层面对比
 
 | 层面 | 做法 | 改 Chromium？ | 额外延迟（相对 viz 出帧） | 零拷贝 | 维护成本 | 评价 |
