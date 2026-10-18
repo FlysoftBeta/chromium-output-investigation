@@ -280,6 +280,61 @@ Ozone 正是为这个场景设计的抽象层，以 `ui/ozone/platform/headless/
 
 ---
 
+## 6.5 决定编译时的具体方案（一台 Windows、多人各用一个完整浏览器）
+
+场景：一台 Windows PC，几个人各自远程使用一个**完整的** Chrome（标签栏、地址栏、菜单、扩展都要能用），隔离要求低，前端延迟要尽量压。
+
+### 底座：fork `--headless=new`
+
+理由（均已在源码中核对）：
+- 它是完整的 Chrome（`Browser` / `BrowserView` / 扩展都在），不是精简的 content shell。
+- `HWNDMessageHandlerHeadless` 让所有窗口**都认为自己处于激活、有焦点的状态**，不随系统焦点变化（`hwnd_message_handler.cc`："Headless windows are believed to always have focus"）。所以多个人同时操作各自的窗口，不会抢 Windows 那唯一的键盘焦点。**这正好解决了"一个会话一个焦点"这个最大的障碍。**
+- 窗口被 cloak，不会在物理桌面上叠成一片；native occlusion 节流在 `--headless` 下默认关闭。
+- new headless 用的是进程内的 headless 剪贴板，每个实例互不干扰，正好需要按用户桥接。
+
+每人一个 Chrome 实例（独立的 `--user-data-dir`）。
+
+### 输出：每个顶层窗口挂一个 capturer（补丁小，延迟低于 WGC）
+
+- 枚举每个实例的顶层 aura 窗口：浏览器主窗口、菜单、气泡、下拉框、扩展弹窗，各自有自己的 `ui::Compositor`。用 `views::WidgetObserver`、`aura::EnvObserver` 跟踪窗口的创建、销毁和位置变化。
+- 每个窗口：`compositor->context_factory()->GetHostFrameSinkManager()->CreateVideoCapturer()`，再 `ChangeTarget(compositor->frame_sink_id())`。做法和 `content/browser/media/capture/aura_window_video_capture_device.cc` 一样，该文件在 `use_aura` 下编译，Windows 也包含在内。
+- 参数：`BufferFormatPreference::kPreferSharedImageWithNativeHandle` + ARGB，帧以 `GpuMemoryBufferHandle`（DXGI shared handle）交付，编码进程打开后零拷贝送进硬件编码器。`SetMinCapturePeriod` 设为显示帧间隔，`SetAutoThrottlingEnabled(false)`。
+- 合成：按每个窗口的屏幕坐标（headless 下保存在 `aura::client::kHeadlessBoundsKey`）和层级，把弹出窗口叠到主窗口画面上。可以在编码进程里用 D3D11 合成，开销很小。
+- 延迟：帧在 viz 聚合后马上 copy 出来，**不经过 DWM 合成**，比 WGC 少一个合成帧。
+- 以后要更极致：第二阶段再把 capturer 换成自定义 `OutputPresenter`（§1.1 的 L4），省掉 capturer 那次 GPU blit。
+
+### 输入：直接送进 aura/views 事件管线（全部 UI 可用）
+
+- 在 browser 进程里开一个本地 IPC（named pipe 或 mojo 都可以；也可以在 `chrome/browser/devtools` 加一个自定义 CDP domain，复用现有的 websocket 通道）。
+- 收到 `(窗口 id, 事件)` 后，构造 `ui::MouseEvent` / `ui::MouseWheelEvent` / `ui::KeyEvent` / `ui::TouchEvent`，调用该窗口 `aura::WindowTreeHost` 的 `ui::EventSource::SendEventToSink()`。事件走完整的 aura → views → `RenderWidgetHostViewAura` 管线，**标签栏、地址栏、菜单、页面都能点**，不依赖系统焦点。
+- 中文输入：不要把按键交给本地 IME，而是在客户端完成组字，再通过当前焦点的 `ui::TextInputClient`（`SetCompositionText` / `InsertText`）送入，候选框画在客户端本地。
+- 光标：监听光标变化（`DesktopWindowTreeHostWin::SetCursor` 这一层），把光标类型发给客户端本地绘制，感知延迟最低。
+
+### 原生对话框和系统交互：改成远程版本
+
+- 文件选择 / 另存为：实现一个自定义的 `ui::SelectFileDialogFactory`，弹窗请求转给客户端，用户从自己的电脑选文件上传。这比在服务器上弹 Windows 对话框体验更好。
+- 下载：每个用户一个下载目录，下载完成后推给客户端。
+- 剪贴板：桥接 headless 剪贴板和客户端剪贴板。
+- 打印：Chrome 的打印预览是 WebUI，可以正常显示；禁用"使用系统对话框打印"。
+- 权限气泡、扩展弹窗、对话框都是 views 绘制的，按上面的方法自然能抓到，也能点。
+
+### 延迟相关开关（已核对）
+
+`--double-buffer-compositing`、`--disable-gpu-vsync`（不建议用 `--disable-frame-rate-limit`，多实例时 GPU 压力过大）、`--disable-renderer-backgrounding`、`--disable-background-timer-throttling`。如果后面要按需出帧，把外部 BeginFrame（`ui::Compositor` 的 `ExternalBeginFrameController`）也接进来。
+
+### 补丁规模与编译
+
+| 部分 | 位置 | 估计规模 |
+|---|---|---|
+| 窗口跟踪 + capturer 管理 + IPC 服务 | 新目录，例如 `chrome/browser/cloud_stream/`，在 headless 启动路径（`chrome_browser_main_extra_parts_headless`）里初始化 | 1–2k 行 |
+| 输入注入 + IME + 光标 | 同上，加上少量 `ui/views/win` 或 `desktop_window_tree_host_win` 的钩子 | 0.5–1k 行 |
+| 文件对话框 / 下载 / 剪贴板桥接 | `SelectFileDialogFactory` 实现 + `DownloadManagerDelegate` 设置 + headless clipboard 适配 | 0.5–1k 行 |
+| 现有代码的修改 | 尽量只在初始化处插入几行 | < 100 行 |
+
+核心逻辑放在新文件里，对现有文件只改几行，跟版本 rebase 的成本很低。
+
+编译（Windows）：VS 2022 + Windows SDK + depot_tools，磁盘至少 100 GB（建议 SSD），内存建议 32 GB 以上。args.gn 用 `is_debug=false is_component_build=false symbol_level=0 blink_symbol_level=0 enable_nacl=false`。8 核机器第一次全量编译需要几个小时，之后的增量编译只要几分钟。
+
 ## 7. 源码核对记录（Chromium M158.0.8111.0，commit `f05e8113`，未编译）
 
 用 `git clone --depth=1 --filter=blob:none --sparse` 只检出了相关目录（约 150 MB），未编译，也未拉取 third_party。
