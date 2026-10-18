@@ -73,6 +73,7 @@
 1. `VizProcessTransportFactory::OnEstablishedGpuChannel()`（`content/browser/compositor/viz_process_transport_factory.cc`）组装 `RootCompositorFrameSinkParams`：
    - `:423` `root_params->widget = compositor->widget();`
    - **【P1】** 改为：cloud 模式下传 `gfx::kNullAcceleratedWidget`。
+   - 注意：空句柄**只出现在发给 GPU 进程的这个参数里，窗口本身仍然存在**。browser 进程的顶层 HWND（`HWNDMessageHandlerHeadless` 创建并 cloak）照常存在，`compositor->widget()` 仍是它，消息循环、TSF、UIA、frame 代码都继续使用它。消失的只是 GPU 进程里由 `DCompPresenter` 创建、挂在顶层 HWND 下的 `ChildWindowWin` 及其 DComp/swap chain。GPU 以为自己在离屏渲染，画进一张不属于任何窗口的纹理。
    - 软件合成（`--disable-gpu`、GPU 被 blocklist、GPU 反复崩溃后的回退、或某个 widget 设了 `force_software_compositing`）**在 headless 下本来就不用 HWND**，所以 P1 不需要区分 GPU/软件：
      - browser 进程把 `--headless` 转发给 GPU 进程（`content/browser/gpu/gpu_process_host.cc:294`，在复制给 GPU 进程的开关列表里）；
      - GPU 进程 `VizCompositorThreadRunnerImpl` 读取它（`components/viz/service/main/viz_compositor_thread_runner_impl.cc:241`），传给 `OutputSurfaceProviderImpl(gpu_service, headless)`；
