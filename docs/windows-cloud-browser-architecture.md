@@ -2,7 +2,7 @@
 
 > 范围：Chromium latest（M14x），Windows 宿主。目标是把渲染输出接到自定义管线（如 WebRTC），并能注入输入；对比 Windows 原生方案与 WSL/Linux 容器方案；评估 GPU（NVIDIA / Intel）接入方式，以及 WGC 是否可行。暂不讨论具体 codec。
 >
-> 调研日期：2026-10。标注「需 PoC 验证」的结论来自源码结构推断或二手资料，没有实测。
+> 调研日期：2026-10。源码结论已对照 Chromium `main`（**M158.0.8111.0**，commit `f05e8113`）的 sparse checkout 核对过（未编译），见 §7。标注「需 PoC 验证」的结论来自源码结构推断或二手资料，没有实测。
 
 ---
 
@@ -11,7 +11,7 @@
 | 问题 | 结论 |
 |---|---|
 | Windows 上实现 Ozone platform？ | **不可行或代价极高。** Ozone 只支持 Linux / ChromeOS / Fuchsia，Windows 走 `ui/views/win` + `DesktopWindowTreeHostWin` + DirectComposition，没有 Ozone 抽象层。在 Windows 上"写一个 Ozone platform"等于把整个 Windows UI 栈移植到 Ozone，不现实。 |
-| Windows 上最佳 hack 层面 | **viz 显示合成器的输出设备层（`SkiaOutputDevice`）+ 无窗口（headless / OSR）宿主**。输出用 D3D11 共享纹理，零拷贝交给编码器；输入走 `RenderWidgetHost::Forward*Event`。次选是 **`FrameSinkVideoCapturer`**（tab capture 用的同一套机制，基本不用改 Chromium，但多一次 GPU 拷贝/格式转换）。 |
+| Windows 上最佳 hack 层面 | **viz 显示合成器的输出设备层（`SkiaOutputDevice`）+ 无窗口宿主（`//headless` 的 headless_shell；注意 `chrome --headless` 在 Windows 上会创建隐藏的真实 HWND，走的是 DComp 路径，不适合）**。输出用 D3D11 共享纹理，零拷贝交给编码器；输入走 `RenderWidgetHost::Forward*Event`。次选是 **`FrameSinkVideoCapturer`**（tab capture 用的同一套机制，基本不用改 Chromium，但多一次 GPU 拷贝/格式转换）。 |
 | WGC 是否可行 | **能做 PoC，不建议用于生产。** 帧在 DWM 合成之后才到 WGC，比在 viz 内取帧多出约 1–2 个 vsync（60Hz 下约 16–35 ms），另外还有可见窗口、交互式会话、输入只能走 SendInput/PostMessage、无法做多租户等结构性问题（见 §3）。 |
 | "WSL3" | **Microsoft 已公开否认 WSL 3 存在**；Build 2026 发布的是 **WSL Containers（`wslc.exe`）**，"WSL 3 近原生 GPU" 的文章是误报。现有可用的是 WSL2 的 GPU-PV（`/dev/dxg`）。 |
 | WSL2 + Linux Chromium | Ozone 可以随意定制（这是 Ozone 的设计初衷），但 **WSL 下 GPU 只能走 Mesa d3d12（GL）/ dzn（Vulkan）翻译层，没有 DRM/GBM/dmabuf**，渲染到编码无法零拷贝；所有 distro/容器**共享同一个 utility VM 和内核**，不是安全边界。**不建议作为多租户生产方案。** |
@@ -21,7 +21,7 @@
 **推荐路线**
 
 1. **短期 PoC（1–2 周）**：Windows 原生 Chromium，基于 CEF 或 Electron 的 OSR shared-texture（底层就是 `FrameSinkVideoCapturer`），拿到 D3D11 纹理 → libwebrtc 自定义 `VideoTrackSource`；输入用 CEF 的 `SendMouse/KeyEvent`。先跑通端到端，测出延迟基线。
-2. **生产（自维护 Chromium 分支）**：基于 `//headless`（chrome-headless-shell）或 content embedder，新增一个 `SkiaOutputDevice`，直接渲染到可跨进程共享的 D3D SharedImage，外部 BeginFrame 控制帧节奏；补丁集中在 `components/viz/service/display_embedder/`，rebase 成本可控。
+2. **生产（自维护 Chromium 分支）**：基于 `//headless`（headless_shell）或 content embedder，在 Windows 上启用 `SkiaOutputDeviceBufferQueue` 并配一个自定义 `OutputPresenter`（或改造 `SkiaOutputDeviceOffscreen`），让根 render pass 直接画进可跨进程共享的 D3D SharedImage，用 `gfx::D3DSharedFence` 同步，外部 BeginFrame 控制帧节奏；补丁集中在 `components/viz/service/display_embedder/`，rebase 成本可控。
 3. **隔离**：每租户一个独立 browser 进程树，跑在独立低权限用户 + Job Object 下，按密度/安全等级再叠加 Windows 进程隔离容器或 Hyper-V GPU-P VM。
 
 ---
@@ -45,13 +45,15 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 
 关键源码位置（M14x）：
 
-- `components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc`：按平台和 surface handle 选择 OutputDevice。`gpu::kNullSurfaceHandle` → `SkiaOutputDeviceOffscreen`。
-- `components/viz/service/display_embedder/skia_output_device_offscreen.cc`：离屏输出，**最适合改造成"渲染到共享纹理"的模板**。
-- `components/viz/service/display_embedder/skia_output_device_dcomp.cc`、`ui/gl/dc_layer_tree.cc`：Windows 正常窗口的 DComp 路径。视频可能走硬件 overlay，**不经过根 render pass**，所以在窗口模式下截根 surface 可能漏掉视频（需要 `--disable-direct-composition` 或 `--disable-features=DirectCompositionVideoOverlays` 之类的开关，以实际版本的 flag 为准）。
-- `components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.cc`：tab capture、`getDisplayMedia(preferCurrentTab)`、CEF/Electron shared-texture OSR 都用这套机制，基于 `CopyOutputRequest`，可以输出 GPU NV12/ARGB 纹理（Windows 上带 DXGI shared handle）。
-- `gpu/command_buffer/service/shared_image/d3d_image_backing.cc`：D3D11 SharedImage backing，可导出 NT shared handle，是跨进程零拷贝的基础。
-- `headless/`、`components/headless/`：headless shell / new headless。无可见窗口时 surface handle 为空，最终走 Offscreen 设备。
-- 渲染后端在迁移：Windows 上 Skia **Ganesh/ANGLE(D3D11)** 正在逐步换成 **Graphite/Dawn(D3D11/D3D12)**。新增的 OutputDevice 应该**基于 SharedImage 抽象**来写，不要直接依赖 ANGLE EGL，否则 Graphite 切换后要重写。
+- `components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc`：`InitializeForGL / InitializeForVulkan / InitializeForDawn` 三条初始化路径，每条都是先判断 `dependency_->IsOffscreen()`（即 `surface_handle_ == gpu::kNullSurfaceHandle`），是则用 `SkiaOutputDeviceOffscreen`；否则在 Windows 上用 `SkiaOutputDeviceDComp`（GL 路径在 DComp 关闭时退回 `SkiaOutputDeviceGL`）。`SkiaOutputDeviceBufferQueue` 被 `#if !BUILDFLAG(IS_WIN)` 排除在 Windows 之外。
+- `components/viz/service/display_embedder/skia_output_device_offscreen.cc`：离屏输出（约 260 行）。**注意：它是直接用 Graphite recorder / GrContext 创建私有 backend texture，不是 SharedImage，所以不能直接跨进程共享**，要改成 SharedImage 分配才能用。
+- `components/viz/service/display_embedder/skia_output_device_buffer_queue.cc` + `output_presenter.h`：BufferQueue 负责分配 SharedImage 环形缓冲，`OutputPresenter` 接口（`Reshape / Present / ScheduleOverlayPlane`）拿到主平面的 `OverlayImageRepresentation::ScopedReadAccess`。在 Windows 上，D3D backing 的 overlay representation 带 `GetAcquireFence()/SetReleaseFence()`（`gfx::D3DSharedFence`），**正好可以用来做跨进程生产者/消费者同步**。这是比改 Offscreen 更"顺着架构"的切入点。
+- `components/viz/service/display_embedder/skia_output_device_dcomp.cc`、`ui/gl/dc_layer_tree.cc`、`ui/gl/direct_composition_support.cc`：Windows 正常窗口的 DComp 路径。视频可能走硬件 overlay，**不经过根 render pass**，在窗口模式下截根 surface 可能漏掉视频。可以用 `--disable-direct-composition` 整体关闭 DComp；源码里**没有**单独关闭视频 overlay 的开关（只有 `--enable-direct-composition-video-overlays`），但所有 GPU workaround 都可以用同名开关强制打开，例如 `--disable_direct_composition_video_overlays=1`。
+- `components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.cc`：tab capture、`getDisplayMedia(preferCurrentTab)`、CEF/Electron shared-texture OSR 都用这套机制，基于 `CopyOutputRequest`。`mojom::BufferFormatPreference::kPreferSharedImageWithNativeHandle` 时输出不可 CPU 映射的 GPU SharedImage，以 `GpuMemoryBufferHandle` 交付（Windows 上即 DXGI shared handle）。支持 I420/ARGB/RGBAF16/NV12；**NV12 只能配 `kPreferMappableSharedImage`**（源码中有 CHECK）；帧池容量为 `kDesignLimitMaxFrames + 1`。
+- `gpu/command_buffer/service/shared_image/d3d_image_backing.cc` + `dxgi_shared_handle_manager.h`：D3D11 SharedImage backing，通过 `DXGISharedHandleState` 管理 NT shared handle，是跨进程零拷贝的基础。
+- `headless/lib/browser/headless_window_tree_host.cc`：headless_shell 的 `HeadlessWindowTreeHost::GetAcceleratedWidget()` 返回空 widget → surface handle 为空 → **Offscreen 设备**。headless_shell 在 Windows 上可以编译（`headless/BUILD.gn` 中有 `is_win` 分支）。
+- `ui/views/win/hwnd_message_handler_headless.h`：**`chrome --headless`（new headless）在 Windows 上用 `HWNDMessageHandlerHeadless`，"platform windows exist but are never shown"**，即仍然有真实 HWND → 有 surface handle → **走 DComp 路径**，不是 Offscreen。所以生产方案应基于 `//headless`（headless_shell）或自己的 content embedder，而不是 `chrome --headless`。
+- **渲染后端（M158 已核对）**：`gpu/config/gpu_finch_features.cc` 中 `kSkiaGraphite` 在 Windows/Apple 上 **默认开启**；`DawnContextProvider::GetDefaultBackendType()` 在 Windows 上默认 **D3D11**（`--skia-graphite-dawn-backend=d3d12` 可切 D3D12）。Ganesh/ANGLE 只是回退路径。所以新增的输出设备必须**基于 SharedImage 抽象**，同时兼容 Graphite/Dawn，不要写死 ANGLE EGL。好消息是默认后端仍然是 D3D11，D3D11 共享纹理/keyed mutex/shared fence 的方案依然成立。
 
 ### 1.1 各 hack 层面对比
 
@@ -61,7 +63,7 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 | L1 tab capture → 浏览器内 WebRTC | 扩展 `chrome.tabCapture` / `getDisplayMedia`，直接在页面里建 RTCPeerConnection | 否 | 约 1 帧 | GPU 内部是 | 低 | 最快能出 demo；但编码/拥塞控制被 Chromium 内置 WebRTC 限死，难以统一调度多租户 |
 | L2 CEF / Electron OSR shared texture | CEF `shared_texture_enabled` → `OnAcceleratedPaint`；Electron `offscreen.useSharedTexture` | 否（用 CEF/Electron） | 约 1 帧（capturer 拷贝 + 可能的格式转换） | 是（D3D11 shared handle） | 中：跟随 CEF/Electron 版本 | **PoC 首选**。注意社区报告过的问题：某些版本退回 `OnPaint`、NV12 时不回调、`OpenSharedResource` 崩溃等，**锁定版本并做回归测试** |
 | L3 自定义 `FrameSinkVideoCapturer` 消费者 | embedder 里直接调 capturer（不经过 CEF） | 少量 | 约 1 帧 | 是 | 中 | L2 的"自己掌控"版本 |
-| **L4 自定义 `SkiaOutputDevice`** | 新增 `SkiaOutputDeviceSharedTexture`：根 render pass 直接画进 D3D SharedImage（环形 3 缓冲），`Present` 时发信号（keyed mutex / D3D12 fence）通知编码进程 | 是（viz 内约 1–2k 行） | **≈0**（画完就是最终帧） | 是，无多余拷贝 | 中高：每个大版本 rebase，补丁比较集中 | **生产首选** |
+| **L4 自定义 `SkiaOutputDevice`** | 方案 a：在 Windows 上放开 `SkiaOutputDeviceBufferQueue` + 新增 `OutputPresenterSharedTexture`（BufferQueue 分配 D3D SharedImage 环形缓冲，presenter 在 `Present` 时通过 `D3DSharedFence` 把帧交给编码进程）；方案 b：把 `SkiaOutputDeviceOffscreen` 的私有 backend texture 换成带 shared handle 的 SharedImage | 是（viz 内约 1–2k 行） | **≈0**（画完就是最终帧） | 是，无多余拷贝 | 中高：每个大版本 rebase，补丁比较集中 | **生产首选** |
 | L5 改 DComp/DWM 层 | 截 DComp visual tree | 是，且侵入大 | — | — | 很高 | 不推荐 |
 | WGC | 见 §3 | 否 | +1–2 vsync，外加 DWM 合成 | 是（拿到 D3D11 纹理） | 低 | 只做 PoC / 兜底 |
 
@@ -73,7 +75,9 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 
 **L4 的注意点**：
 
-- `<select>` 下拉、日期选择器、部分 autofill 弹层在桌面平台是**独立的 popup widget**，有自己的 CompositorFrameSink，不在主 surface 里。可选做法：(a) 像 CEF 一样单独拿 popup 帧自己叠加；(b) 在 viz 侧把 popup surface 以 `SurfaceDrawQuad` 嵌入到根合成（改动更深）；(c) 尽量启用 Blink 的页面内渲染实现（以当时版本的 feature flag 为准）。
+- `<select>` 下拉、日期选择器等是**独立的 popup widget**（`RenderWidgetHostViewAura::InitAsPopup`），有自己的 CompositorFrameSink。
+  - 在 **headless_shell** 里，popup 的 aura window 通过 `ParentWindowWithContext` 交给 `HeadlessWindowParentingClient`，后者直接返回 root window，所以 popup 是同一个 `WindowTreeHost` / `ui::Compositor` 下的子窗口，**应该会被合成进根 surface，也就是 L4 能直接拿到**（源码推断，需 PoC 验证）。
+  - 在 **L1–L3（`FrameSinkVideoCapturer`，包括 CEF/Electron OSR）** 下，capturer 只抓 WebContents 的 frame sink，**popup 不在画面里**，需要像 CEF 那样单独拿 popup 帧（`PET_POPUP`）自己叠加。
 - 浏览器 UI（权限气泡、下载栏、对话框、文件选择器）在 headless 里不存在，需要 embedder 自己实现策略（自动拒绝/允许，或做成 Web UI 推给客户端）。
 - 跨进程同步：D3D11 用 `IDXGIKeyedMutex`，或用 D3D11.4/12 shared fence（`ID3D11Fence` / `ID3D12Fence` 共享句柄）。编码进程最好和 Chromium GPU 进程在**同一个 adapter（LUID 一致）**，否则共享会失败或退化成跨卡拷贝。
 
@@ -103,7 +107,7 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 
 - **WDDM 调度没有硬配额**：第 2、3 层下，某个租户跑重 WebGL/WebGPU 可以拖慢所有租户。缓解手段：开 HAGS、按租户设置进程 GPU 优先级（`D3DKMTSetProcessSchedulingPriorityClass`）、Chromium 侧限帧（外部 BeginFrame）、限制或禁用 WebGPU。
 - **编码器并发**：GeForce 有 NVENC 会话数限制（消费级卡目前为 8 路左右，随驱动版本变化），数据中心卡（L4/L40/A16）没有这个限制。Intel QSV 不限会话数，但受媒体引擎吞吐约束。多租户密度往往**先卡在编码器上，而不是渲染**。
-- **多卡**：每个 browser 用 `--use-adapter-luid=` 绑定到指定 GPU（以当前版本 flag 为准），编码进程也绑定到同一 LUID，保证共享纹理零拷贝。
+- **多卡**：每个 browser 用 `--use-adapter-luid=`（`ui/gl/gl_switches.cc`，已核对）绑定到指定 GPU，编码进程也绑定到同一 LUID，保证共享纹理零拷贝。
 - **会话**：headless / OSR 方案不需要交互式桌面，可以在服务会话里跑（GPU 在 Session 0 下的 D3D 渲染是可用的），这是相对 WGC 的一大优势。
 
 ---
@@ -122,7 +126,7 @@ Browser UI (views/cc)──CompositorFrame──▶      │
 
 **结构性问题**（比延迟更致命）：
 
-- 必须有**交互式桌面会话**和真实 HWND。窗口不能最小化或 cloaked；被遮挡时 WGC 仍能抓到，但 **Chromium 的原生遮挡检测会节流/停绘**，需要 `--disable-backgrounding-occluded-windows`，并关闭 `CalculateNativeWinOcclusion` 相关 feature。
+- 必须有**交互式桌面会话**和真实 HWND。窗口不能最小化或 cloaked；被遮挡时 WGC 仍能抓到，但 **Chromium 的原生遮挡检测会节流/停绘**，需要 `--disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion`（`kCalculateNativeWinOcclusion` 默认开启，已核对）。
 - 多租户需要多个会话（RDS 多会话或多用户登录），每个会话都要 DWM 和桌面，开销大，管理也复杂。
 - 输入只能 `SendInput`（需前台，整会话共享）或 `PostMessage`（不可靠），**基本无法支撑多租户**。
 - 抓的是窗口，带浏览器 UI；要 kiosk/app 模式，而且没法拿到 popup 与主页面分离的信息。
@@ -146,8 +150,8 @@ Ozone 正是为这个场景设计的抽象层，以 `ui/ozone/platform/headless/
 - `OzonePlatform` 子类：注册新的 platform 名（`--ozone-platform=cloud`）。
 - `PlatformWindow`：不创建真实窗口，持有 `PlatformWindowDelegate`。**输入注入**：把网络收到的事件构造成 `ui::MouseEvent / KeyEvent / TouchEvent`，调 `delegate->DispatchEvent()`，这是最干净的注入点；键盘布局可以复用 `ui/events/ozone/layout`。
 - `SurfaceFactoryOzone`：
-  - GL：返回一个 surfaceless `GLOzone`（参考 headless 的实现），配合 ANGLE（`--use-angle=gl-egl` 或 vulkan）。
-  - 取帧：正常 Linux 上用 `NativePixmap`（GBM + dmabuf）做 scanout buffer，dmabuf 直接导入 VA-API/NVENC，**零拷贝**。
+  - GL：Ozone headless 的 `GetAllowedGLImplementations()` 只允许 `kGLImplementationEGLANGLE`，对应的 `GLOzone` 成员名就叫 `swiftshader_implementation_`；view surface 是把帧写进文件的 `FileGLSurface`（调试用）。自定义平台需要自己实现 GLOzone 和 Vulkan surface（headless 已有 `vulkan_implementation_headless.cc` 可参考）。
+  - 取帧：**Ozone headless 的 `CreateNativePixmap()` 返回的是 `TestPixmap`（假 pixmap），不能导出 dmabuf。** 要零拷贝，必须移植 `ui/ozone/platform/drm` 或 wayland 里基于 GBM 的 `NativePixmap` 实现（render node 即可，不需要 KMS），这样 dmabuf 才能直接导入 VA-API/NVENC。
 - `CreateClipboard / CursorFactory / InputMethod`：按租户实现。
 
 ### 4.3 在 WSL 里的致命问题
@@ -188,6 +192,29 @@ Ozone 正是为这个场景设计的抽象层，以 `ui/ozone/platform/headless/
 4. **（可选）方案 D 验证**：只为确认"WSL 下读回链路的开销与 WebGL 兼容性"，用于向决策方说明为什么不走 WSL。
 
 ---
+
+## 7. 源码核对记录（Chromium M158.0.8111.0，commit `f05e8113`，未编译）
+
+用 `git clone --depth=1 --filter=blob:none --sparse` 只检出了相关目录（约 150 MB），未编译，也未拉取 third_party。
+
+| 结论 | 源码依据 | 结果 |
+|---|---|---|
+| Ozone 只在 Linux/ChromeOS/Fuchsia 启用 | `build/config/ozone.gni`: `use_ozone = is_chromeos \|\| is_fuchsia \|\| is_linux` | ✅ |
+| 空 surface handle → Offscreen 设备 | `skia_output_surface_dependency_impl.cc` `IsOffscreen()`；`skia_output_surface_impl_on_gpu.cc` GL/Vulkan/Dawn 三条路径 | ✅ |
+| Windows 窗口模式 → DComp；BufferQueue 不在 Windows 上用 | 同上，`#if !BUILDFLAG(IS_WIN)` | ✅ |
+| Offscreen 设备用的是私有纹理，不是 SharedImage | `skia_output_device_offscreen.cc`（`createBackendTexture`） | ✅（**修正**了初版"直接改 Offscreen 就能共享"的表述） |
+| headless_shell 无 HWND，`chrome --headless` 有隐藏 HWND | `headless_window_tree_host.cc`；`hwnd_message_handler_headless.h`；`hwnd_message_handler.cc` 中按 `Screen::IsHeadless()` 选择 | ✅（**新增**区分） |
+| headless_shell 可在 Windows 上编译 | `headless/BUILD.gn` 的 `is_win` 分支 | ✅ |
+| Windows 默认 Graphite + Dawn D3D11 | `gpu_finch_features.cc` `kSkiaGraphite`；`dawn_context_provider.cc` `GetDefaultBackendType()` | ✅（**修正**了初版"正在迁移"） |
+| D3D SharedImage 带 shared handle 和 shared fence | `d3d_image_backing.cc`、`dxgi_shared_handle_manager.h`；`shared_image_representation.h` 的 `GetAcquireFence/SetReleaseFence` | ✅ |
+| capturer 能输出带 native handle 的 GPU 帧 | `frame_sink_video_capture.mojom` `kPreferSharedImageWithNativeHandle`；`mappable_shared_image_video_frame_pool.cc` | ✅；NV12 仅限 mappable 模式 |
+| 外部 BeginFrame | `headless/public/switches.h` `enable-begin-frame-control` | ✅ |
+| 输入注入接口 | `render_widget_host_impl.h` `ForwardMouseEvent/ForwardWheelEvent/ForwardKeyboardEvent/ForwardGestureEvent`、`ImeSetComposition/ImeCommitText` | ✅ |
+| headless_shell 中 popup 与主窗口共用 root window | `headless_window_parenting_client.cc` 返回 `root_window_`；`render_widget_host_view_aura.cc` `InitAsPopup` | ✅（是否被合成进同一帧需 PoC） |
+| Ozone headless 不支持真实 dmabuf | `headless_surface_factory.cc` `CreateNativePixmap` → `TestPixmap` | ✅ |
+| 开关名 | `--disable-direct-composition`、`--use-adapter-luid`（`ui/gl/gl_switches.cc`）；`--disable-backgrounding-occluded-windows`（`content_switches.cc`）；`CalculateNativeWinOcclusion`（`ui_base_features.cc`）；workaround 可用同名开关强制（`gpu_util_unittest.cc`） | ✅ |
+
+没有在源码里核对的：WGC 延迟（`third_party/webrtc` 未检出，且需要实测）、CEF/Electron 的实现（不在 Chromium 仓库）、所有 GPU 虚拟化和 WSL 相关结论（属于 Windows/驱动层面）。
 
 ## 参考资料
 
