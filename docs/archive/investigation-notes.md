@@ -1,4 +1,8 @@
-# Windows 云浏览器：Chromium 输出/输入接入与多租户 GPU 方案调研
+# 调研过程记录（存档）
+
+> 这是方案选型过程中的完整调研记录，包含后来被否决的方案（Ozone、WSL、WGC、CEF、DLL 注入、headless_shell 等）。**最终敲定的方案见 [../architecture.md](../architecture.md)**，以该文档为准；本文中与之冲突的结论以敲定方案为准。
+
+## 原标题：Windows 云浏览器：Chromium 输出/输入接入与多租户 GPU 方案调研
 
 > 范围：Chromium latest（M14x），Windows 宿主。目标是把渲染输出接到自定义管线（如 WebRTC），并能注入输入；对比 Windows 原生方案与 WSL/Linux 容器方案；评估 GPU（NVIDIA / Intel）接入方式，以及 WGC 是否可行。暂不讨论具体 codec。
 >

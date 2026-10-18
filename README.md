@@ -1,3 +1,4 @@
 # chromium-output-investigation
 
-- [Windows 云浏览器：Chromium 输出/输入接入与多租户 GPU 方案调研](docs/windows-cloud-browser-architecture.md)
+- **[敲定方案：fork `--headless=new` + 保留 HWND + 离屏输出](docs/architecture.md)**：全链路和 patch 位点
+- [调研过程记录（存档）](docs/archive/investigation-notes.md)：选型过程，以及被否决的方案
